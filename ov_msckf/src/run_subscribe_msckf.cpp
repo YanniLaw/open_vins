@@ -99,7 +99,7 @@ int main(int argc, char **argv) {
   }
 
   // Spin off to ROS
-  PRINT_DEBUG("done...spinning to ros\n");
+  PRINT_INFO("done...spinning to ros\n");
 #if ROS_AVAILABLE == 1
   // ros::spin();
   ros::AsyncSpinner spinner(0);

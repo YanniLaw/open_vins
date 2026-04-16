@@ -210,12 +210,58 @@ void ROS2Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
       // create subscriber
       // auto sub = _node->create_subscription<sensor_msgs::msg::Image>(
       //    cam_topic, rclcpp::SensorDataQoS(), std::bind(&ROS2Visualizer::callback_monocular, this, std::placeholders::_1, i));
-      auto sub = _node->create_subscription<sensor_msgs::msg::Image>(
-          cam_topic, 10, [this, i](const sensor_msgs::msg::Image::SharedPtr msg0) { callback_monocular(msg0, i); });
-      subs_cam.push_back(sub);
-      PRINT_INFO("subscribing to cam (mono): %s\n", cam_topic.c_str());
+      // rclcpp::QoS image_qos(rclcpp::KeepLast(1));
+      // if (DetectTopicQoSByName(_node, cam_topic, &image_qos)) {
+      //   PRINT_INFO("Detected QoS for topic %s: reliability=%d durability=%d\n", cam_topic.c_str(), image_qos.reliability(),
+      //              image_qos.durability());
+      // } else {
+      //   PRINT_WARNING("Could not detect QoS for topic %s, using default QoS settings.\n", cam_topic.c_str());
+      // }
+      auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
+      if (cam_topic.find("compressed") != std::string::npos) {
+        auto sub = _node->create_subscription<sensor_msgs::msg::CompressedImage>(
+            cam_topic, qos, [this, i](const sensor_msgs::msg::CompressedImage::SharedPtr msg0) { callback_monocular_compressed(msg0, i); });
+        subs_cam_compressed.push_back(sub);
+        PRINT_INFO("subscribing to cam (mono compressed): %s\n", cam_topic.c_str());
+      } else {
+        auto sub = _node->create_subscription<sensor_msgs::msg::Image>(
+            cam_topic, 10, [this, i](const sensor_msgs::msg::Image::SharedPtr msg0) { callback_monocular(msg0, i); });
+        subs_cam.push_back(sub);
+        PRINT_INFO("subscribing to cam (mono): %s\n", cam_topic.c_str());
+      }
     }
   }
+}
+
+bool ROS2Visualizer::DetectTopicQoSByName(const std::shared_ptr<rclcpp::Node>& node,
+    const std::string& topic_name, rclcpp::QoS* qos, int wait_timeout_ms) {
+  if (qos == nullptr || topic_name.empty()) {
+    return false;
+  }
+
+  // const std::string normalized_topic = NormalizeTopic(topic_name);
+  constexpr int kPollIntervalMs = 100;
+  const int max_attempts = std::max(1, wait_timeout_ms / kPollIntervalMs);
+  for (int i = 0; i < max_attempts; ++i) {
+    std::vector<rclcpp::TopicEndpointInfo> infos;
+    try {
+      infos = node->get_publishers_info_by_topic(topic_name);
+    } catch (const std::exception&) {
+      return false;
+    }
+
+    if (!infos.empty()) {
+      const auto detected = infos.front().qos_profile();
+      // Only adopt reliability and durability from the publisher.
+      // History policy from endpoint info is often UNKNOWN, which
+      // crashes subscription creation.  Keep the caller's defaults.
+      qos->reliability(detected.reliability());
+      qos->durability(detected.durability());
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
+  }
+  return false;
 }
 
 void ROS2Visualizer::visualize() {
@@ -526,6 +572,49 @@ void ROS2Visualizer::callback_monocular(const sensor_msgs::msg::Image::SharedPtr
     message.masks.push_back(_app->get_params().masks.at(cam_id0));
   } else {
     message.masks.push_back(cv::Mat::zeros(cv_ptr->image.rows, cv_ptr->image.cols, CV_8UC1));
+  }
+
+  // append it to our queue of images
+  std::lock_guard<std::mutex> lck(camera_queue_mtx);
+  camera_queue.push_back(message);
+  std::sort(camera_queue.begin(), camera_queue.end());
+}
+
+void ROS2Visualizer::callback_monocular_compressed(const sensor_msgs::msg::CompressedImage::SharedPtr msg0, int cam_id0) {
+
+  // Check if we should drop this image
+  double timestamp = msg0->header.stamp.sec + msg0->header.stamp.nanosec * 1e-9;
+  double time_delta = 1.0 / _app->get_params().track_frequency;
+  if (camera_last_timestamp.find(cam_id0) != camera_last_timestamp.end() && timestamp < camera_last_timestamp.at(cam_id0) + time_delta) {
+    return;
+  }
+  camera_last_timestamp[cam_id0] = timestamp;
+
+  // Decode the compressed image
+  cv::Mat decoded;
+  try {
+    decoded = cv::imdecode(cv::Mat(msg0->data), cv::IMREAD_GRAYSCALE);
+  } catch (cv::Exception &e) {
+    PRINT_ERROR("cv::imdecode exception: %s", e.what());
+    return;
+  }
+  if (decoded.empty()) {
+    PRINT_ERROR("failed to decode compressed image on cam %d", cam_id0);
+    return;
+  }
+
+  // Create the measurement
+  ov_core::CameraData message;
+  message.timestamp = timestamp;
+  message.sensor_ids.push_back(cam_id0);
+  message.images.push_back(decoded.clone());
+
+  // Load the mask if we are using it, else it is empty
+  // TODO: in the future we should get this from external pixel segmentation
+  if (_app->get_params().use_mask) {
+    message.masks.push_back(_app->get_params().masks.at(cam_id0));
+  } else {
+    message.masks.push_back(cv::Mat::zeros(decoded.rows, decoded.cols, CV_8UC1));
   }
 
   // append it to our queue of images
