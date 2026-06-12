@@ -56,7 +56,7 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
 
   // Nice debug
   this->params = params_;
-  params.print_and_load_estimator();
+  params.print_and_load_estimator(); // 仅打印参数，不加载
   params.print_and_load_noise();
   params.print_and_load_state();
   params.print_and_load_trackers();
@@ -69,7 +69,7 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   // Create the state!!
   state = std::make_shared<State>(params.state_options);
 
-  // Set the IMU intrinsics
+  // Set the IMU intrinsics，设置IMU内参
   state->_calib_imu_dw->set_value(params.vec_dw);
   state->_calib_imu_dw->set_fej(params.vec_dw);
   state->_calib_imu_da->set_value(params.vec_da);
@@ -163,6 +163,11 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   }
 }
 
+/**
+ * @brief 
+ * 
+ * @param message 
+ */
 void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
 
   // The oldest time we need IMU with is the last clone
@@ -171,9 +176,11 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
   if (oldest_time > state->_timestamp) {
     oldest_time = -1;
   }
+  // 如果系统还没初始化，则改用初始化窗口来反推一个更合适的保留起点，保证初始化器能拿到足够长的 IMU 历史数据进行初始化
   if (!is_initialized_vio) {
     oldest_time = message.timestamp - params.init_options.init_window_time + state->_calib_dt_CAMtoIMU->value()(0) - 0.10;
   }
+  // 往 Propagator 的 IMU 数据队列里添加新数据，并清理掉过旧的数据，确保 Propagator 只保留必要的历史数据
   propagator->feed_imu(message, oldest_time);
 
   // Push back to our initializer

@@ -120,7 +120,7 @@ inline Eigen::Matrix<double, 4, 1> rot_2_quat(const Eigen::Matrix<double, 3, 3> 
 
 /**
  * @brief Skew-symmetric matrix from a given 3x1 vector
- *
+ * 构造反对称矩阵
  * This is based on equation 6 in [Indirect Kalman Filter for 3D Attitude Estimation](http://mars.cs.umn.edu/tr/reports/Trawny05b.pdf):
  * \f{align*}{
  *  \lfloor\mathbf{v}\times\rfloor =
@@ -140,17 +140,17 @@ inline Eigen::Matrix<double, 3, 3> skew_x(const Eigen::Matrix<double, 3, 1> &w) 
 
 /**
  * @brief Converts JPL quaterion to SO(3) rotation matrix
- *
+ * JPL四元数转旋转矩阵
  * This is based on equation 62 in [Indirect Kalman Filter for 3D Attitude Estimation](http://mars.cs.umn.edu/tr/reports/Trawny05b.pdf):
  * \f{align*}{
  *  \mathbf{R} = (2q_4^2-1)\mathbf{I}_3-2q_4\lfloor\mathbf{q}\times\rfloor+2\mathbf{q}\mathbf{q}^\top
  * @f}
  *
- * @param[in] q JPL quaternion
+ * @param[in] q JPL quaternion [x, y, z, w]
  * @return 3x3 SO(3) rotation matrix
  */
 inline Eigen::Matrix<double, 3, 3> quat_2_Rot(const Eigen::Matrix<double, 4, 1> &q) {
-  Eigen::Matrix<double, 3, 3> q_x = skew_x(q.block(0, 0, 3, 1));
+  Eigen::Matrix<double, 3, 3> q_x = skew_x(q.block(0, 0, 3, 1)); // x,y,z part of quat
   Eigen::MatrixXd Rot = (2 * std::pow(q(3, 0), 2) - 1) * Eigen::MatrixXd::Identity(3, 3) - 2 * q(3, 0) * q_x +
                         2 * q.block(0, 0, 3, 1) * (q.block(0, 0, 3, 1).transpose());
   return Rot;
@@ -180,7 +180,7 @@ inline Eigen::Matrix<double, 3, 3> quat_2_Rot(const Eigen::Matrix<double, 4, 1> 
 inline Eigen::Matrix<double, 4, 1> quat_multiply(const Eigen::Matrix<double, 4, 1> &q, const Eigen::Matrix<double, 4, 1> &p) {
   Eigen::Matrix<double, 4, 1> q_t;
   Eigen::Matrix<double, 4, 4> Qm;
-  // create big L matrix
+  // create big L matrix 论文公式9
   Qm.block(0, 0, 3, 3) = q(3, 0) * Eigen::MatrixXd::Identity(3, 3) - skew_x(q.block(0, 0, 3, 1));
   Qm.block(0, 3, 3, 1) = q.block(0, 0, 3, 1);
   Qm.block(3, 0, 1, 3) = -q.block(0, 0, 3, 1).transpose();
@@ -494,7 +494,8 @@ inline Eigen::Matrix<double, 4, 4> Omega(Eigen::Matrix<double, 3, 1> w) {
  * @return Normalized quaterion
  */
 inline Eigen::Matrix<double, 4, 1> quatnorm(Eigen::Matrix<double, 4, 1> q_t) {
-  if (q_t(3, 0) < 0) {
+  // 四元数存在双覆盖性，即q和-q表示同一个旋转，所以为了消除这个歧义，我们强制q_4为正来保证唯一性
+  if (q_t(3, 0) < 0) { // 约定w分量始终≥0
     q_t *= -1;
   }
   return q_t / q_t.norm();

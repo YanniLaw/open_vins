@@ -46,7 +46,7 @@ void TrackKLT::feed_new_camera(const CameraData &message) {
   // NOTE: DO NOT PARALLELIZE THESE!
   // NOTE: These seem to be much slower if you parallelize them...
   rT1 = boost::posix_time::microsec_clock::local_time();
-  size_t num_images = message.images.size();
+  size_t num_images = message.images.size(); // 单目或双目
   for (size_t msg_id = 0; msg_id < num_images; msg_id++) {
 
     // Lock this data feed for this camera
@@ -66,11 +66,11 @@ void TrackKLT::feed_new_camera(const CameraData &message) {
       img = message.images.at(msg_id);
     }
 
-    // Extract image pyramid
+    // Extract image pyramid，构建光流金字塔
     std::vector<cv::Mat> imgpyr;
     cv::buildOpticalFlowPyramid(img, imgpyr, win_size, pyr_levels);
 
-    // Save!
+    // Save! 保留原图与金字塔图像，供后续跟踪使用
     img_curr[cam_id] = img;
     img_pyramid_curr[cam_id] = imgpyr;
   }
@@ -79,9 +79,9 @@ void TrackKLT::feed_new_camera(const CameraData &message) {
   // If we are doing binocular tracking, then we should parallize our tracking
   if (num_images == 1) {
     feed_monocular(message, 0);
-  } else if (num_images == 2 && use_stereo) {
+  } else if (num_images == 2 && use_stereo) { // 双目跟踪
     feed_stereo(message, 0, 1);
-  } else if (!use_stereo) {
+  } else if (!use_stereo) { // 多个单目相机跟踪
     parallel_for_(cv::Range(0, (int)num_images), LambdaBody([&](const cv::Range &range) {
                     for (int i = range.start; i < range.end; i++) {
                       feed_monocular(message, i);

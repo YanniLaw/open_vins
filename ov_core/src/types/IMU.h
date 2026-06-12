@@ -37,7 +37,7 @@ namespace ov_type {
 class IMU : public Type {
 
 public:
-  IMU() : Type(15) {
+  IMU() : Type(15) { // IMU误差状态包含15个元素
 
     // Create all the sub-variables
     _pose = std::shared_ptr<PoseJPL>(new PoseJPL());

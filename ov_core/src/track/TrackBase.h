@@ -52,7 +52,7 @@ class FeatureDatabase;
  * The user can ask this database for features which can then be used in an MSCKF or batch-based setting.
  * The feature tracks store both the raw (distorted) and undistorted/normalized values.
  * Right now we just support two camera models, see: undistort_point_brown() and undistort_point_fisheye().
- *
+ * 目前只支持两种模型，后续可以添加更多模型
  * @m_class{m-note m-warning}
  *
  * @par A Note on Multi-Threading Support
@@ -189,6 +189,7 @@ protected:
   std::unordered_map<size_t, std::vector<size_t>> ids_last;
 
   /// Master ID for this tracker (atomic to allow for multi-threading)
+  // 所有特征点(包括提取的fast角点，以及aruco角点)的全局唯一ID，原子变量以支持多线程访问，确保所有特征点具有唯一ID值
   std::atomic<size_t> currid;
 
   // Timing variables (most children use these...)

@@ -31,12 +31,16 @@ TrackBase::TrackBase(std::unordered_map<size_t, std::shared_ptr<CamBase>> camera
                      HistogramMethod histmethod)
     : camera_calib(cameras), database(new FeatureDatabase()), num_features(numfeats), use_stereo(stereo), histogram_method(histmethod) {
   // Our current feature ID should be larger then the number of aruco tags we have (each has 4 corners)
+  // 特征点ID防冲突，aruco标签每个有4个角点，先把这部分 ID 区间“让出来”，普通特征从后面开始分配
+  // 这样，无论前端怎么疯狂提取新特征点，普通点的 ID 永远不会和人工地标（ArUco）的 ID 撞车
   currid = 4 * (size_t)numaruco + 1;
   // Create our mutex array based on the number of cameras we have
   // See https://stackoverflow.com/a/24170141/7718197
+  // OpenVINS 支持多相机系统（单目、双目、甚至多目）。当多个相机的图像数据高频并行输入时，
+  // 为了防止同时修改前端特征数据库导致程序崩溃，每个相机通道（Feed）都需要一把独立的互斥锁（std::mutex）
   if (mtx_feeds.empty() || mtx_feeds.size() != camera_calib.size()) {
     std::vector<std::mutex> list(camera_calib.size());
-    mtx_feeds.swap(list);
+    mtx_feeds.swap(list); // swap 操作极其高效，它在底层只是交换了指针和容量指针，并没有发生任何锁对象的复制或移动
   }
 }
 

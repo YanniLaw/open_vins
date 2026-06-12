@@ -90,11 +90,19 @@ namespace ov_type {
  *
  */
 class JPLQuat : public Type {
-
+/**
+ * @brief JPLQuat class
+ *
+ * 自己实现的JPL四元数类，继承自Type类，表示一个JPL四元数类型，用于表示旋转。
+ * 该类包含了四元数的定义、更新方法以及与旋转矩阵的转换等功能。
+ * JPL四元数的存储顺序为 [q1, q2, q3, q4]，其中q4是标量部分，q1、q2、q3是向量部分。
+ * 该类还包含了一个左乘误差状态定义，表示四元数的误差状态与SO(3)误差状态之间的关系。
+ */
 public:
-  JPLQuat() : Type(3) {
+  JPLQuat() : Type(3) { // 四元数的误差状态是3维的，因为它与SO(3)误差状态等价，SO(3)误差状态是一个3维的轴角表示。
     Eigen::Vector4d q0 = Eigen::Vector4d::Zero();
-    q0(3) = 1.0;
+    q0(3) = 1.0; // [0,0,0,1] is the identity rotation in JPL convention
+    // 构造函数中不能安全调用虚函数(set_value)，因此我们直接调用内部函数来设置初始值和FEJ值。
     set_value_internal(q0);
     set_fej_internal(q0);
   }
@@ -115,9 +123,9 @@ public:
 
     assert(dx.rows() == _size);
 
-    // Build perturbing quaternion
+    // Build perturbing quaternion，论文formula 68 69 70
     Eigen::Matrix<double, 4, 1> dq;
-    dq << .5 * dx, 1.0;
+    dq << .5 * dx, 1.0; // 构造扰动四元数，左乘误差状态定义中，误差状态是轴角的一半，所以这里乘以0.5
     dq = ov_core::quatnorm(dq);
 
     // Update estimate and recompute R
@@ -125,6 +133,11 @@ public:
   }
 
   /**
+   * @brief 两层设计的职责分离：
+   *  - set_value() 和 set_fej() 作为对外接口，支持多态调用，允许通过基类指针调用这些方法。
+   *  - set_value_internal() 和 set_fej_internal() 作为内部函数，非虚函数，构造安全，直接设置值并计算旋转矩阵。这些函数不依赖于虚函数机制，因此在构造函数中调用是安全的。
+   * 这种设计确保了在构造函数中初始化对象时不会调用虚函数，从而避免了潜在的未定义行为，同时仍然提供了对外接口的多态性。
+   * 
    * @brief Sets the value of the estimate and recomputes the internal rotation matrix
    * @param new_value New value for the quaternion estimate (JPL quat as x,y,z,w)
    */
@@ -135,10 +148,10 @@ public:
    * @param new_value New value for the quaternion estimate (JPL quat as x,y,z,w)
    */
   void set_fej(const Eigen::MatrixXd &new_value) override { set_fej_internal(new_value); }
-
+  // 返回基类指针，允许通过基类指针调用这些方法，实现多态性。
   std::shared_ptr<Type> clone() override {
-    auto Clone = std::shared_ptr<JPLQuat>(new JPLQuat());
-    Clone->set_value(value());
+    auto Clone = std::shared_ptr<JPLQuat>(new JPLQuat()); // 新对象
+    Clone->set_value(value()); // 深拷贝
     Clone->set_fej(fej());
     return Clone;
   }
@@ -150,6 +163,17 @@ public:
   Eigen::Matrix<double, 3, 3> Rot_fej() const { return _Rfej; }
 
 protected:
+  // 为什么这里是存储旋转矩阵？ 这是一个性能与数值稳定性权衡的设计决策
+  // 1. EKF 计算中旋转矩阵使用频率远高于四元数， 如果存储的是四元数，每次需要旋转矩阵时都要进行转换，效率较低。
+  // 2. FEJ要求在整个滑动窗口生命周期内保持旋转矩阵不变，如果存储四元数，每次更新都需要重新计算旋转矩阵，增加了计算开销。
+  // 为什么不用 Eigen::Quaterniond？
+  // Eigen::Quaterniond 的存储顺序是 [x,y,z,w]（Hamilton），
+  // 而 OpenVINS 用的是 JPL 约定 [x,y,z,w] 但语义不同（JPL 的 w 对应 Hamilton 的 -w 在某些操作上）。
+  // 混用会引入难以排查的符号错误。
+  // 整个代码库统一用 Eigen::Matrix<double, 4, 1> 存四元数，用 Eigen::Matrix<double, 3, 3> 存旋转矩阵，
+  // 约定明确、不依赖 Eigen 内部的四元数语义。
+  // 本质上是以空间换时间的缓存策略，_R 和 _Rfej 是 _value 和 _fej 的派生缓存，由 set_value_internal / set_fej_internal 保证始终同步。
+  
   // Stores the rotation
   Eigen::Matrix<double, 3, 3> _R;
 
@@ -161,7 +185,7 @@ protected:
    * @param new_value New value for the quaternion estimate
    */
   void set_value_internal(const Eigen::MatrixXd &new_value) {
-
+    // 传入的是JPL四元数，存储顺序为 [x,y,z,w]
     assert(new_value.rows() == 4);
     assert(new_value.cols() == 1);
 
@@ -176,7 +200,7 @@ protected:
    * @param new_value New value for the quaternion estimate
    */
   void set_fej_internal(const Eigen::MatrixXd &new_value) {
-
+    // 传入的是JPL四元数，存储顺序为 [x,y,z,w]
     assert(new_value.rows() == 4);
     assert(new_value.cols() == 1);
 

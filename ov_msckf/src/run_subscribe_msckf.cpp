@@ -61,7 +61,7 @@ int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
   rclcpp::NodeOptions options;
   options.allow_undeclared_parameters(true);
-  options.automatically_declare_parameters_from_overrides(true);
+  options.automatically_declare_parameters_from_overrides(true); // 这两句一般配套使用，允许使用未声明的参数并自动从命令行覆盖参数
   auto node = std::make_shared<rclcpp::Node>("run_subscribe_msckf", options);
   node->get_parameter<std::string>("config_path", config_path);
 #endif

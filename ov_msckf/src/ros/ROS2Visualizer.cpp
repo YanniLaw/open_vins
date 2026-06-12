@@ -176,6 +176,7 @@ void ROS2Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
 
   // Logic for sync stereo subscriber
   // https://answers.ros.org/question/96346/subscribe-to-two-image_raws-with-one-function/?answer=96491#post-id-96491
+  // 双目相机订阅需要使用message_filters来同步两个相机的图像消息，以确保它们在处理时具有相同的时间戳。
   if (_app->get_params().state_options.num_cameras == 2) {
     // Read in the topics
     std::string cam_topic0, cam_topic1;
@@ -199,7 +200,7 @@ void ROS2Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
     sync_subs_cam.push_back(image_sub1);
     PRINT_INFO("subscribing to cam (stereo): %s\n", cam_topic0.c_str());
     PRINT_INFO("subscribing to cam (stereo): %s\n", cam_topic1.c_str());
-  } else {
+  } else { // 对于非双目相机订阅(单目或者多目，但不是双目)，我们直接创建单独的订阅者即可，不需要同步器
     // Now we should add any non-stereo callbacks here
     for (int i = 0; i < _app->get_params().state_options.num_cameras; i++) {
       // read in the topic
@@ -481,6 +482,12 @@ void ROS2Visualizer::visualize_final() {
   PRINT_INFO(REDPURPLE "TIME: %.3f seconds\n\n" RESET, (rT2 - rT1).total_microseconds() * 1e-6);
 }
 
+/**
+ * @brief imu回调函数，接收IMU数据并将其转换为内部格式，然后将其传递给VIO系统进行处理。
+ * 同时，该函数还负责根据IMU数据的时间戳来更新相机测量队列，并在必要时启动一个线程来处理相机测量的更新和可视化。
+ * 
+ * @param msg 
+ */
 void ROS2Visualizer::callback_inertial(const sensor_msgs::msg::Imu::SharedPtr msg) {
 
   // convert into correct format
@@ -490,23 +497,25 @@ void ROS2Visualizer::callback_inertial(const sensor_msgs::msg::Imu::SharedPtr ms
   message.am << msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z;
 
   // send it to our VIO system
-  _app->feed_measurement_imu(message);
-  visualize_odometry(message.timestamp);
+  _app->feed_measurement_imu(message); // 喂入IMU测量数据到VIO系统
+  visualize_odometry(message.timestamp); // 需要初始化完成之后才会进行
 
   // If the processing queue is currently active / running just return so we can keep getting measurements
   // Otherwise create a second thread to do our update in an async manor
   // The visualization of the state, images, and features will be synchronous with the update!
-  if (thread_update_running)
+  // 原子变量，这是一把"是否已有更新线程在跑"的旗帜，防止并发地启动多个处理线程
+  if (thread_update_running) // 虽然是原子变量，但是check并不原子
     return;
   thread_update_running = true;
-  std::thread thread([&] {
-    // Lock on the queue (prevents new images from appending)
+  std::thread thread([&] { // TODO: 应该手动捕获message变量，以确保在这个线程中可以访问到它
+    // Lock on the queue (prevents new images from appending)，相机队列加锁
     std::lock_guard<std::mutex> lck(camera_queue_mtx);
 
-    // Count how many unique image streams
+    // Count how many unique image streams 统计队列中有多少种不同相机ID
+    // 对于双目：等价为1路（同步后合并）sensor_ids [0,1]；单目N路：要N路都有数据
     std::map<int, bool> unique_cam_ids;
     for (const auto &cam_msg : camera_queue) {
-      unique_cam_ids[cam_msg.sensor_ids.at(0)] = true;
+      unique_cam_ids[cam_msg.sensor_ids.at(0)] = true; // cam_msg.sensor_ids.at(0)
     }
 
     // If we do not have enough unique cameras then we need to wait
@@ -535,17 +544,24 @@ void ROS2Visualizer::callback_inertial(const sensor_msgs::msg::Imu::SharedPtr ms
   // If we are single threaded, then run single threaded
   // Otherwise detach this thread so it runs in the background!
   if (!_app->get_params().use_multi_threading_subs) {
-    thread.join();
+    thread.join(); // 单线程：阻塞等待处理完成，IMU回调串行执行
   } else {
-    thread.detach();
+    thread.detach(); // 多线程：后台运行，IMU回调立即返回继续接收数据
   }
 }
 
+/**
+ * @brief 单目回调函数，接收单目图像数据并将其转换为内部格式，然后添加到相机测量队列中进行处理。
+ * 
+ * @param msg0 单目图像消息
+ * @param cam_id0 相机ID，用于标识不同的相机数据流(该框架支持多相机系统，每个相机都有一个唯一的ID)
+ */
 void ROS2Visualizer::callback_monocular(const sensor_msgs::msg::Image::SharedPtr msg0, int cam_id0) {
 
   // Check if we should drop this image
   double timestamp = msg0->header.stamp.sec + msg0->header.stamp.nanosec * 1e-9;
   double time_delta = 1.0 / _app->get_params().track_frequency;
+  // 大于track_frequency频率的图像会被丢弃，避免处理过多的图像数据导致系统过载
   if (camera_last_timestamp.find(cam_id0) != camera_last_timestamp.end() && timestamp < camera_last_timestamp.at(cam_id0) + time_delta) {
     return;
   }
@@ -560,7 +576,7 @@ void ROS2Visualizer::callback_monocular(const sensor_msgs::msg::Image::SharedPtr
     return;
   }
 
-  // Create the measurement
+  // Create the measurement，填充相机测量数据结构，包括时间戳、相机ID、图像数据和掩码（如果使用）。
   ov_core::CameraData message;
   message.timestamp = cv_ptr->header.stamp.sec + cv_ptr->header.stamp.nanosec * 1e-9;
   message.sensor_ids.push_back(cam_id0);
@@ -577,7 +593,7 @@ void ROS2Visualizer::callback_monocular(const sensor_msgs::msg::Image::SharedPtr
   // append it to our queue of images
   std::lock_guard<std::mutex> lck(camera_queue_mtx);
   camera_queue.push_back(message);
-  std::sort(camera_queue.begin(), camera_queue.end());
+  std::sort(camera_queue.begin(), camera_queue.end()); // 如果有多个相机数据流，确保它们按照时间戳顺序处理
 }
 
 void ROS2Visualizer::callback_monocular_compressed(const sensor_msgs::msg::CompressedImage::SharedPtr msg0, int cam_id0) {
@@ -623,6 +639,14 @@ void ROS2Visualizer::callback_monocular_compressed(const sensor_msgs::msg::Compr
   std::sort(camera_queue.begin(), camera_queue.end());
 }
 
+/**
+ * @brief 双目回调函数，接收双目图像数据并将其转换为内部格式，然后添加到相机测量队列中进行处理。
+ * 
+ * @param msg0 左目图像消息
+ * @param msg1 右目图像消息
+ * @param cam_id0 左目相机ID
+ * @param cam_id1 右目相机ID
+ */
 void ROS2Visualizer::callback_stereo(const sensor_msgs::msg::Image::ConstSharedPtr msg0, const sensor_msgs::msg::Image::ConstSharedPtr msg1,
                                      int cam_id0, int cam_id1) {
 

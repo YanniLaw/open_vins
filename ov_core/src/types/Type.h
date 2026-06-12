@@ -28,8 +28,8 @@
 namespace ov_type {
 
 /**
- * @brief Base class for estimated variables.
- *
+ * @brief Base class for estimated variables.估计变量的基类
+ * 用于定义滤波器中状态变量的基本结构和行为。每个状态变量都具有一个误差状态大小（size）和一个在协方差矩阵中的位置（id）。此外，每个状态变量还包含一个当前估计值（value）和一个第一估计值（fej）。该类还定义了一个纯虚函数update()，用于根据误差状态的扰动更新变量的值，以及一个纯虚函数clone()，用于创建变量的克隆。通过继承这个基类，可以实现不同类型的状态变量，如向量、四元数等，并且可以根据需要定义它们的更新规则和克隆方法。
  * This class is used how variables are represented or updated (e.g., vectors or quaternions).
  * Each variable is defined by its error state size and its location in the covariance matrix.
  * We additionally require all sub-types to have a update procedure.
@@ -125,10 +125,10 @@ protected:
   /// Current best estimate
   Eigen::MatrixXd _value;
 
-  /// Location of error state in covariance
+  /// Location of error state in covariance  协方差矩阵中的起始索引位置
   int _id = -1;
 
-  /// Dimension of error state
+  /// Dimension of error state  误差状态的维度
   int _size = -1;
 };
 

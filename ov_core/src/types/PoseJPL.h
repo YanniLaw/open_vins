@@ -37,7 +37,7 @@ namespace ov_type {
 class PoseJPL : public Type {
 
 public:
-  PoseJPL() : Type(6) {
+  PoseJPL() : Type(6) { // PoseJPL的误差状态包含6个元素，3个用于位置误差，3个用于姿态误差（与SO(3)误差状态等价）
 
     // Initialize subvariables
     _q = std::shared_ptr<JPLQuat>(new JPLQuat());
@@ -46,7 +46,7 @@ public:
     // Set our default state value
     Eigen::Matrix<double, 7, 1> pose0;
     pose0.setZero();
-    pose0(3) = 1.0;
+    pose0(3) = 1.0; // w 分量为1，表示初始旋转为单位旋转
     set_value_internal(pose0);
     set_fej_internal(pose0);
   }
@@ -154,7 +154,7 @@ protected:
    * @param new_value New value we should set
    */
   void set_value_internal(const Eigen::MatrixXd &new_value) {
-
+    // 7*1 vector containing [quat (x,y,z,w), pos (x,y,z)]
     assert(new_value.rows() == 7);
     assert(new_value.cols() == 1);
 
@@ -172,7 +172,7 @@ protected:
    * @param new_value New value we should set
    */
   void set_fej_internal(const Eigen::MatrixXd &new_value) {
-
+    // 7*1 vector containing [quat (x,y,z,w), pos (x,y,z)]
     assert(new_value.rows() == 7);
     assert(new_value.cols() == 1);
 

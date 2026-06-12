@@ -93,9 +93,9 @@ public:
     assert(vec.cols() == 1);
     Eigen::Matrix3d D_matrix = Eigen::Matrix3d::Identity();
     if (imu_model == StateOptions::ImuModel::KALIBR) {
-      D_matrix << vec(0), 0, 0, vec(1), vec(3), 0, vec(2), vec(4), vec(5);
+      D_matrix << vec(0), 0, 0, vec(1), vec(3), 0, vec(2), vec(4), vec(5); // 下三角矩阵，列优先填充
     } else {
-      D_matrix << vec(0), vec(1), vec(3), 0, vec(2), vec(4), 0, 0, vec(5);
+      D_matrix << vec(0), vec(1), vec(3), 0, vec(2), vec(4), 0, 0, vec(5); // 上三角矩阵，列优先填充
     }
     return D_matrix;
   }
@@ -111,7 +111,7 @@ public:
     assert(vec.rows() == 9);
     assert(vec.cols() == 1);
     Eigen::Matrix3d Tg = Eigen::Matrix3d::Zero();
-    Tg << vec(0), vec(3), vec(6), vec(1), vec(4), vec(7), vec(2), vec(5), vec(8);
+    Tg << vec(0), vec(3), vec(6), vec(1), vec(4), vec(7), vec(2), vec(5), vec(8); // 列优先填充
     return Tg;
   }
 
@@ -188,7 +188,7 @@ private:
   /// Covariance of all active variables
   Eigen::MatrixXd _Cov;
 
-  /// Vector of variables
+  /// Vector of variables 状态变量的集合，包含IMU状态、克隆状态、SLAM特征、相机-IMU时间偏移、相机外参、相机内参、IMU内参等
   std::vector<std::shared_ptr<ov_type::Type>> _variables;
 };
 
