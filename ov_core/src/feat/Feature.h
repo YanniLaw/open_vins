@@ -39,25 +39,29 @@ namespace ov_core {
 class Feature {
 
 public:
-  /// Unique ID of this feature
+  /// Unique ID of this feature 全局唯一ID
   size_t featid;
 
-  /// If this feature should be deleted
+  /// If this feature should be deleted 该特征点是否应该被删除
   bool to_delete;
 
   /// UV coordinates that this feature has been seen from (mapped by camera ID)
+  /// 该特征点的带畸变像素坐标观测值 key为相机ID, value为该相机观测到的特征点坐标列表
   std::unordered_map<size_t, std::vector<Eigen::VectorXf>> uvs;
 
   /// UV normalized coordinates that this feature has been seen from (mapped by camera ID)
+  /// 该特征点的去畸变归一化坐标观测值 key为相机ID, value为该相机观测到的特征点坐标列表
   std::unordered_map<size_t, std::vector<Eigen::VectorXf>> uvs_norm;
 
   /// Timestamps of each UV measurement (mapped by camera ID)
+  /// 该特征点的观测时间 key为相机ID, value为该相机观测到的特征点的时间列表
   std::unordered_map<size_t, std::vector<double>> timestamps;
 
   /// What camera ID our pose is anchored in!! By default the first measurement is the anchor.
+  /// 该特征点的锚定相机ID，默认第一个观测为锚点
   int anchor_cam_id = -1;
 
-  /// Timestamp of anchor clone
+  /// Timestamp of anchor clone 锚点的时间戳
   double anchor_clone_timestamp;
 
   /// Triangulated position of this feature, in the anchor frame

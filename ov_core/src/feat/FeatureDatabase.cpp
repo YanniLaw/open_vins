@@ -56,11 +56,22 @@ bool FeatureDatabase::get_feature_clone(size_t id, Feature &feat) {
   return true;
 }
 
+/**
+ * @brief Update or add a feature with the given observation.
+ * 
+ * @param id Feature ID
+ * @param timestamp Timestamp of the observation
+ * @param cam_id Camera ID
+ * @param u Pixel x-coordinate 带畸变像素坐标
+ * @param v Pixel y-coordinate 带畸变像素坐标
+ * @param u_n Normalized x-coordinate  去畸变归一化坐标
+ * @param v_n Normalized y-coordinate  去畸变归一化坐标
+ */
 void FeatureDatabase::update_feature(size_t id, double timestamp, size_t cam_id, float u, float v, float u_n, float v_n) {
 
   // Find this feature using the ID lookup
   std::lock_guard<std::mutex> lck(mtx);
-  if (features_idlookup.find(id) != features_idlookup.end()) {
+  if (features_idlookup.find(id) != features_idlookup.end()) { // 该特征点已存在数据库中
     // Get our feature
     std::shared_ptr<Feature> feat = features_idlookup.at(id);
     // Append this new information to it!
@@ -73,7 +84,7 @@ void FeatureDatabase::update_feature(size_t id, double timestamp, size_t cam_id,
   // Debug info
   // PRINT_DEBUG("featdb - adding new feature %d",(int)id);
 
-  // Else we have not found the feature, so lets make it be a new one!
+  // Else we have not found the feature, so lets make it be a new one! 该特征点不在数据库中 
   std::shared_ptr<Feature> feat = std::make_shared<Feature>();
   feat->featid = id;
   feat->uvs[cam_id].push_back(Eigen::Vector2f(u, v));
