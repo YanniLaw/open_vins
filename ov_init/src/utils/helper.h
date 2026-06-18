@@ -127,7 +127,9 @@ public:
 
   /**
    * @brief Given a gravity vector, compute the rotation from the inertial reference frame to this vector.
-   *
+   * 根据传感器（IMU）当前测量到的重力向量，构建一个从“全局惯性坐标系G”到“当前传感器坐标系I”的旋转矩阵R_GtoI
+   * 在 VIO（视觉惯性里程计，如 OpenVINS）或惯导系统中，通常会假设在全局惯性坐标系（G）中，重力只沿着 Z 轴。
+   * 因此，通过寻找与当前重力向量正交的另外两个轴，就能凑齐一个完整的、正交的坐标系三维基底。
    * The key assumption here is that our gravity is along the vertical direction in the inertial frame.
    * We can take this vector (z_in_G=0,0,1) and find two arbitrary tangent directions to it.
    * https://en.wikipedia.org/wiki/Gram%E2%80%93Schmidt_process
@@ -139,10 +141,21 @@ public:
 
     // This will find an orthogonal vector to gravity which is our local z-axis
     // We need to ensure we normalize after each one such that we obtain unit vectors
+    // 确定新坐标系的Z轴: 直接将传感器测得的重力向量 gravity_inI 进行单位化（归一化），作为新坐标系的 Z 轴。
+    // 因为在全局坐标系中重力在Z轴，那么在传感器坐标系下，重力的方向自然就对应了全局 Z 轴在传感器地平面的映射。
     Eigen::Vector3d z_axis = gravity_inI / gravity_inI.norm();
+    // 寻找正交的 X 轴和 Y 轴（避免共线退化）
+    // 要构成一个三维坐标系，我们需要找到两个与 Z 轴垂直的单位向量。函数使用叉乘（Cross Product）来寻找正交向量
+    // 核心逻辑：任何向量与 Z 轴叉乘，其结果必然垂直于 Z 轴。
+    // 规避数值风险：如果选择的辅助向量刚好和 Z 轴平行（或夹角极小），叉乘结果就会接近 0，导致归一化时除以 0 出错。
+    // 为了防止这个问题，代码引入了条件判断: 
+    // 通过计算 z_axis 与 e_1、e_2 的点积（投影大小），评估哪一个轴与当前 z_axis 更接近，从而选择合适的辅助向量进行叉乘。
+    // 如果 z_axis 更靠近 e_2（即 inner1 < inner2）：说明 z_axis 远离 e_1，此时用 e_1 叉乘最安全； 
+    // 反之：说明 z_axis 远离 e_2，用 e_2 叉乘最安全
+    // 确定 x_axis 并归一化后，再通过 y_axis = z_axis.cross(x_axis) 完美闭合右手坐标系
     Eigen::Vector3d x_axis, y_axis;
-    Eigen::Vector3d e_1(1.0, 0.0, 0.0);
-    Eigen::Vector3d e_2(0.0, 1.0, 0.0);
+    Eigen::Vector3d e_1(1.0, 0.0, 0.0); // 世界坐标系的 X 轴
+    Eigen::Vector3d e_2(0.0, 1.0, 0.0); // 世界坐标系的 Y 轴
     double inner1 = e_1.dot(z_axis) / z_axis.norm();
     double inner2 = e_2.dot(z_axis) / z_axis.norm();
     if (fabs(inner1) < fabs(inner2)) {
@@ -165,6 +178,7 @@ public:
     // y_axis = y_axis / y_axis.norm();
 
     // Rotation from our global (where gravity is only along the z-axis) to the local one
+    // 一个旋转矩阵的前三列分别代表原坐标系的 X, Y, Z 三个轴在目标坐标系下的投影（表示）。
     R_GtoI.block(0, 0, 3, 1) = x_axis;
     R_GtoI.block(0, 1, 3, 1) = y_axis;
     R_GtoI.block(0, 2, 3, 1) = z_axis;

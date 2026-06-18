@@ -80,13 +80,14 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
   // Directly return if the initialization thread is running
   // Note that we lock on the queue since we could have finished an update
   // And are using this queue to propagate the state forward. We should wait in this case
+  // 如果初始化线程正在运行，则直接返回false
   if (thread_init_running) {
     std::lock_guard<std::mutex> lck(camera_queue_init_mtx);
-    camera_queue_init.push_back(message.timestamp);
+    camera_queue_init.push_back(message.timestamp); // 缓存当前时间戳
     return false;
   }
 
-  // If the thread was a success, then return success!
+  // If the thread was a success, then return success! 初始化成功了也直接返回成功
   if (thread_init_success) {
     return true;
   }
@@ -103,6 +104,11 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
     // Try to initialize the system
     // We will wait for a jerk if we do not have the zero velocity update enabled
     // Otherwise we can initialize right away as the zero velocity will handle the stationary case
+    // 如果没有启用零速度更新，则必须等待jerk(加加速度)来初始化; 否则可以立即初始化，因为零速度更新将处理静止情况
+    // 为什么需要jerk？
+    // 初始化时需要估计 IMU 的陀螺仪偏置和加速度计偏置
+    // 静止状态：仅有重力加速度，无法区分偏置和真实加速度
+    // 有加速度突变（Jerk）：系统观察到动态变化，能分离偏置成分
     bool wait_for_jerk = (updaterZUPT == nullptr);
     bool success = initializer->initialize(timestamp, covariance, order, state->_imu, wait_for_jerk);
 
@@ -120,7 +126,15 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
       // Cleanup any features older than the initialization time
       // Also increase the number of features to the desired amount during estimation
       // NOTE: we will split the total number of features over all cameras uniformly
+      // 既然已经初始化完成了，就清理掉特征数据库中比初始化时间更早的测量数据
       trackFEATS->get_feature_database()->cleanup_measurements(state->_timestamp);
+      // 为什么要增加特征数量？
+      // 因为初始化阶段和正常估计阶段用的是两套目标数。
+      // 创建前端追踪器时，先用的是 init_max_features，专门给初始化阶段降负载
+      // 初始化成功后，再切到估计阶段目标 num_pts / num_cameras
+      // 为什么要这么设计？
+      // 初始化更重（要解初始姿态/速度/偏置等），用更少特征可降低计算开销、加快初始化。
+      // 一旦初始化完成，系统进入持续估计，需要更多特征提升鲁棒性和精度，所以把追踪目标调高
       trackFEATS->set_num_features(std::floor((double)params.num_pts / (double)params.state_options.num_cameras));
       if (trackARUCO != nullptr) {
         trackARUCO->get_feature_database()->cleanup_measurements(state->_timestamp);
@@ -145,6 +159,9 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
 
       // Remove any camera times that are order then the initialized time
       // This can happen if the initialization has taken a while to perform
+      // 把系统从“初始化完成时刻”快速推进到“当前前端时间”，减少初始化线程造成的时间落后
+      // 初始化可能花了几百毫秒到几秒，这段时间新来的图像时间戳先被缓存了，现在要把这些“晚于初始化时刻”的帧用于状态前推
+      // 早于等于 timestamp 的时刻会被丢弃，因为状态已经在那个时间点上了
       std::lock_guard<std::mutex> lck(camera_queue_init_mtx);
       std::vector<double> camera_timestamps_to_init;
       for (size_t i = 0; i < camera_queue_init.size(); i++) {
@@ -156,10 +173,11 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
       // Now we have initialized we will propagate the state to the current timestep
       // In general this should be ok as long as the initialization didn't take too long to perform
       // Propagating over multiple seconds will become an issue if the initial biases are bad
+      // 目的不是每一帧都 clone，而是按步长跳着取，避免一次性加太多 clone 让状态爆炸
       size_t clone_rate = (size_t)((double)camera_timestamps_to_init.size() / (double)params.state_options.max_clone_size) + 1;
       for (size_t i = 0; i < camera_timestamps_to_init.size(); i += clone_rate) {
         propagator->propagate_and_clone(state, camera_timestamps_to_init.at(i));
-        StateHelper::marginalize_old_clone(state);
+        StateHelper::marginalize_old_clone(state); // 如果 clone 超过上限，立即边缘化最老的，保持滑窗大小受控
       }
       PRINT_DEBUG(YELLOW "[init]: moved the state forward %.2f seconds\n" RESET, state->_timestamp - timestamp);
       thread_init_success = true;

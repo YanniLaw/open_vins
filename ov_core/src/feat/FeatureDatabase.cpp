@@ -234,18 +234,23 @@ void FeatureDatabase::cleanup() {
   // PRINT_DEBUG("feat db = %d -> %d\n", sizebefore, (int)features_idlookup.size() << std::endl;
 }
 
+/**
+ * @brief 清理掉特征数据库中指定时间戳之前的测量
+ * 
+ * @param timestamp 给定的时间戳
+ */
 void FeatureDatabase::cleanup_measurements(double timestamp) {
   std::lock_guard<std::mutex> lck(mtx);
   for (auto it = features_idlookup.begin(); it != features_idlookup.end();) {
     // Remove the older measurements
     (*it).second->clean_older_measurements(timestamp);
-    // Count how many measurements
+    // Count how many measurements 统计删除后该特征剩余的测量
     int ct_meas = 0;
     for (const auto &pair : (*it).second->timestamps) {
       ct_meas += (int)(pair.second.size());
     }
     // If delete flag is set, then delete it
-    if (ct_meas < 1) {
+    if (ct_meas < 1) { // 该特征已经没有测量数据了，可以从特征数据库中删除了
       features_idlookup.erase(it++);
     } else {
       it++;

@@ -34,6 +34,17 @@ using namespace ov_core;
 using namespace ov_type;
 using namespace ov_init;
 
+/**
+ * @brief Initialize the static state using IMU data. 
+ * 在“近似静止或出现一次明显加速度激励（jerk）”的情况下，用 IMU 数据给 VIO 一个可用的初始状态（姿态、偏置、协方差）
+ * @param timestamp The timestamp of the current IMU measurement.
+ * @param covariance The covariance matrix of the state.
+ * @param order The order of the state variables.
+ * @param t_imu The IMU state object.
+ * @param wait_for_jerk Flag indicating whether to wait for jerk measurements.
+ * @return true If the initialization was successful.
+ * @return false If the initialization failed.
+ */
 bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<Type>> &order,
                                    std::shared_ptr<IMU> t_imu, bool wait_for_jerk) {
 
@@ -53,6 +64,7 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
   }
 
   // First lets collect a window of IMU readings from the newest measurement to the oldest
+  // 将IMU数据分成两个时间段， window_1to0 为后半段， window_2to1 为前半段
   std::vector<ImuData> window_1to0, window_2to1;
   for (const ImuData &data : *imu_data) {
     if (data.timestamp > newesttime - 0.5 * params.init_window_time && data.timestamp <= newesttime - 0.0 * params.init_window_time) {
@@ -63,7 +75,7 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
     }
   }
 
-  // Return if both of these failed
+  // Return if both of these failed，每个时间段至少有两个测量值
   if (window_1to0.size() < 2 || window_2to1.size() < 2) {
     PRINT_INFO(YELLOW "[init-s]: unable to select window of IMU readings, not enough readings\n" RESET);
     return false;
@@ -74,12 +86,12 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
   for (const ImuData &data : window_1to0) {
     a_avg_1to0 += data.am;
   }
-  a_avg_1to0 /= (int)window_1to0.size();
+  a_avg_1to0 /= (int)window_1to0.size(); // 后半段加速度计均值
   double a_var_1to0 = 0;
   for (const ImuData &data : window_1to0) {
     a_var_1to0 += (data.am - a_avg_1to0).dot(data.am - a_avg_1to0);
   }
-  a_var_1to0 = std::sqrt(a_var_1to0 / ((int)window_1to0.size() - 1));
+  a_var_1to0 = std::sqrt(a_var_1to0 / ((int)window_1to0.size() - 1)); // 后半段加速度计标准差
 
   // Calculate the sample variance for the second newest window from 2 to 1
   Eigen::Vector3d a_avg_2to1 = Eigen::Vector3d::Zero();
@@ -88,14 +100,21 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
     a_avg_2to1 += data.am;
     w_avg_2to1 += data.wm;
   }
-  a_avg_2to1 = a_avg_2to1 / window_2to1.size();
-  w_avg_2to1 = w_avg_2to1 / window_2to1.size();
+  a_avg_2to1 = a_avg_2to1 / window_2to1.size(); // 前半段加速度计均值
+  w_avg_2to1 = w_avg_2to1 / window_2to1.size(); // 前半段陀螺仪均值
   double a_var_2to1 = 0;
   for (const ImuData &data : window_2to1) {
     a_var_2to1 += (data.am - a_avg_2to1).dot(data.am - a_avg_2to1);
   }
-  a_var_2to1 = std::sqrt(a_var_2to1 / ((int)window_2to1.size() - 1));
+  a_var_2to1 = std::sqrt(a_var_2to1 / ((int)window_2to1.size() - 1)); // 前半段加速度计标准差
   PRINT_DEBUG(YELLOW "[init-s]: IMU excitation stats: %.3f,%.3f\n" RESET, a_var_2to1, a_var_1to0);
+
+  // 根据 wait_for_jerk 决策是否允许初始化， 这里分两类情况讨论:
+  // 1） 当 wait_for_jerk = true（希望检测一次“静止→激励”）
+  //    - 后半段激励太小：失败（还没出现 jerk）
+  //    - 前半段激励太大：失败（之前就已经在动，不满足“先静止”）
+  // 2） 当 wait_for_jerk = false（ZUPT 情况，要求静止）
+  //    - 任一时间段激励太大：失败（说明在动，不适合静止初始化）
 
   // If it is below the threshold and we want to wait till we detect a jerk
   if (a_var_1to0 < params.init_imu_thresh && wait_for_jerk) {
@@ -119,19 +138,20 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
   }
 
   // Get rotation with z axis aligned with -g (z_in_G=0,0,1)
-  Eigen::Vector3d z_axis = a_avg_2to1 / a_avg_2to1.norm();
+  Eigen::Vector3d z_axis = a_avg_2to1 / a_avg_2to1.norm(); // 通过静止的前半段平均加速度方向估计重力方向
   Eigen::Matrix3d Ro;
   InitializerHelper::gram_schmidt(z_axis, Ro);
   Eigen::Vector4d q_GtoI = rot_2_quat(Ro);
 
   // Set our biases equal to our noise (subtract our gravity from accelerometer bias)
+  // 根据静止的前半段估计陀螺仪和加速度计零偏
   Eigen::Vector3d gravity_inG;
   gravity_inG << 0.0, 0.0, params.gravity_mag;
   Eigen::Vector3d bg = w_avg_2to1;
   Eigen::Vector3d ba = a_avg_2to1 - quat_2_Rot(q_GtoI) * gravity_inG;
 
   // Set our state variables
-  timestamp = window_2to1.at(window_2to1.size() - 1).timestamp;
+  timestamp = window_2to1.at(window_2to1.size() - 1).timestamp; // 使用前半段最后一个测量的时间戳(因为在这段时间都是静止的)
   Eigen::VectorXd imu_state = Eigen::VectorXd::Zero(16);
   imu_state.block(0, 0, 4, 1) = q_GtoI;
   imu_state.block(10, 0, 3, 1) = bg;

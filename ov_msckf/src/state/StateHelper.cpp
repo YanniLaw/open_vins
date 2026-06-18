@@ -196,6 +196,13 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
   }
 }
 
+/**
+ * @brief 把“初始化器给出的协方差子块”写回到全局状态协方差里，并保持矩阵对称
+ * 
+ * @param state 全局滤波器状态
+ * @param covariance 初始协方差矩阵
+ * @param order 协方差矩阵中各变量的顺序
+ */
 void StateHelper::set_initial_covariance(std::shared_ptr<State> state, const Eigen::MatrixXd &covariance,
                                          const std::vector<std::shared_ptr<ov_type::Type>> &order) {
 
@@ -210,6 +217,8 @@ void StateHelper::set_initial_covariance(std::shared_ptr<State> state, const Eig
 
   // For each variable, lets copy over all other variable cross terms
   // Note: this copies over itself to when i_index=k_index
+  // 它不是“重建整个协方差”，而是“把你指定变量集合的协方差块覆盖进去”。
+  // 未在 order 里的其他变量块保持原值不动
   int i_index = 0;
   for (size_t i = 0; i < order.size(); i++) {
     int k_index = 0;
@@ -220,6 +229,7 @@ void StateHelper::set_initial_covariance(std::shared_ptr<State> state, const Eig
     }
     i_index += order[i]->size();
   }
+  // 用上三角自动镜像出下三角，得到严格对称矩阵（避免后续 LLT/SVD 等算法因为微小不对称而数值不稳）
   state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>();
 }
 

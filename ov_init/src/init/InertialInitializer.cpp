@@ -76,6 +76,17 @@ void InertialInitializer::feed_imu(const ov_core::ImuData &message, double oldes
   }
 }
 
+/**
+ * @brief Initialize the system using IMU and feature data within a specified time window
+ * 
+ * @param timestamp 初始化的时间戳
+ * @param covariance 初始化的协方差矩阵
+ * @param order 
+ * @param t_imu IMU状态
+ * @param wait_for_jerk 是否等待加加速度（Jerk）来初始化(也就是是否开启了零速度更新ZUPT)
+ * @return true 
+ * @return false 
+ */
 bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
                                      std::shared_ptr<ov_type::IMU> t_imu, bool wait_for_jerk) {
 
@@ -84,7 +95,7 @@ bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covaria
   for (auto const &feat : _db->get_internal_data()) {
     for (auto const &camtimepair : feat.second->timestamps) {
       for (auto const &time : camtimepair.second) {
-        newest_cam_time = std::max(newest_cam_time, time);
+        newest_cam_time = std::max(newest_cam_time, time); // 获取特征数据库最新的观测时间
       }
     }
   }
@@ -95,6 +106,7 @@ bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covaria
 
   // Remove all measurements that are older then our initialization window
   // Then we will try to use all features that are in the feature database!
+  // 清理初始化窗口之前的特征数据以及imu数据
   _db->cleanup_measurements(oldest_time);
   auto it_imu = imu_data->begin();
   while (it_imu != imu_data->end() && it_imu->timestamp < oldest_time + params.calib_camimu_dt) {
@@ -103,18 +115,22 @@ bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covaria
 
   // Compute the disparity of the system at the current timestep
   // If disparity is zero or negative we will always use the static initializer
+  // 计算视差判断运动状态
   bool disparity_detected_moving_1to0 = false;
   bool disparity_detected_moving_2to1 = false;
   if (params.init_max_disparity > 0) {
 
     // Get the disparity statistics from this image to the previous
     // Only compute the disparity for the oldest half of the initialization period
+    // 比较初始化窗口的两半：[0, T/2] 和 [T/2, T]
     double newest_time_allowed = newest_cam_time - 0.5 * params.init_window_time;
     int num_features0 = 0;
     int num_features1 = 0;
-    double avg_disp0, avg_disp1;
-    double var_disp0, var_disp1;
+    double avg_disp0, avg_disp1; // 平均视差
+    double var_disp0, var_disp1; // 视差标准差!!!
+    // 计算前半窗口视差统计 [oldest_time, newest_time_allowed]
     FeatureHelper::compute_disparity(_db, avg_disp0, var_disp0, num_features0, newest_time_allowed);
+    // 计算后半窗口视差统计 [newest_time_allowed, newest_cam_time]
     FeatureHelper::compute_disparity(_db, avg_disp1, var_disp1, num_features1, newest_cam_time, newest_time_allowed);
 
     // Return if we can't compute the disparity
@@ -133,6 +149,8 @@ bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covaria
   // Use our static initializer!
   // CASE1: if our disparity says we were static in last window and have moved in the newest, we have a jerk
   // CASE2: if both disparities are below the threshold, then the platform has been stationary during both periods
+  // 两种情况用静止初始化器: 1. 前半窗口静止，后半窗口移动 -> 有加速度突变; 
+  //                     2. 前半窗口静止，后半窗口静止 -> 平台一直静止
   bool has_jerk = (!disparity_detected_moving_1to0 && disparity_detected_moving_2to1);
   bool is_still = (!disparity_detected_moving_1to0 && !disparity_detected_moving_2to1);
   if (((has_jerk && wait_for_jerk) || (is_still && !wait_for_jerk)) && params.init_imu_thresh > 0.0) {
