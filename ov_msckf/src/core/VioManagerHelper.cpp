@@ -96,7 +96,7 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
   thread_init_running = true;
   std::thread thread([&] {
     // Returns from our initializer
-    double timestamp;
+    double timestamp; // VIO系统初始化的时间戳
     Eigen::MatrixXd covariance;
     std::vector<std::shared_ptr<ov_type::Type>> order;
     auto init_rT1 = boost::posix_time::microsec_clock::local_time();
@@ -110,6 +110,7 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
     // 静止状态：仅有重力加速度，无法区分偏置和真实加速度
     // 有加速度突变（Jerk）：系统观察到动态变化，能分离偏置成分
     bool wait_for_jerk = (updaterZUPT == nullptr);
+    // 如果是静止初始化，则timestamp为静止的前半段最后一个测量的时间戳
     bool success = initializer->initialize(timestamp, covariance, order, state->_imu, wait_for_jerk);
 
     // If we have initialized successfully we will set the covariance and state elements as needed
@@ -164,8 +165,9 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
       // 早于等于 timestamp 的时刻会被丢弃，因为状态已经在那个时间点上了
       std::lock_guard<std::mutex> lck(camera_queue_init_mtx);
       std::vector<double> camera_timestamps_to_init;
+      // camera_queue_init是调用try_to_initialize时缓存的相机时间戳(如果当前线程花了很久才完成初始化的话，这些时间戳会被缓存起来)
       for (size_t i = 0; i < camera_queue_init.size(); i++) {
-        if (camera_queue_init.at(i) > timestamp) {
+        if (camera_queue_init.at(i) > timestamp) { // 将初始化时刻之后的相机时间戳加入待初始化列表
           camera_timestamps_to_init.push_back(camera_queue_init.at(i));
         }
       }

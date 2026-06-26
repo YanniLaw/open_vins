@@ -143,7 +143,7 @@ public:
 
   /**
    * @brief Nice helper function that will linearly interpolate between two imu messages.
-   *
+   * 简单的线性插值方法
    * This should be used instead of just "cutting" imu messages that bound the camera times
    * Give better time offset if we use this function, could try other orders/splines if the imu is slow.
    *

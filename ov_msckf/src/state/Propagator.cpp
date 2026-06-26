@@ -30,6 +30,13 @@ using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
 
+/**
+ * @brief Propagates the state forward in time using IMU measurements and clones the state at the specified timestamp.
+ * 
+ * @param state The current state of the system to be propagated.
+ * @param timestamp The timestamp at which to clone the propagated state.
+ * @note The function will crash if attempting to propagate to the same timestamp or backwards in time.
+ */
 void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timestamp) {
 
   // If the difference between the current update time and state is zero
@@ -60,6 +67,7 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
   double t_off_new = state->_calib_dt_CAMtoIMU->value()(0);
 
   // First lets construct an IMU vector of measurements we need
+  // 从 IMU 缓冲区选取 [time0, time1] 区间内的所有测量值并自动处理边界处的插值
   double time0 = state->_timestamp + last_prop_time_offset;
   double time1 = timestamp + t_off_new;
   std::vector<ov_core::ImuData> prop_data;
@@ -266,6 +274,15 @@ bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double times
   return true;
 }
 
+/**
+ * @brief 从IMU数据中选择在给定时间区间内的测量数据，并进行必要的插值，以便用于状态传播
+ * 
+ * @param imu_data IMU测量数据的数组
+ * @param time0 状态传播的起始时间
+ * @param time1 状态传播的结束时间
+ * @param warn 是否在没有IMU测量时发出警告
+ * @return std::vector<ov_core::ImuData> 选中的IMU测量数据，包括必要的插值
+ */
 std::vector<ov_core::ImuData> Propagator::select_imu_readings(const std::vector<ov_core::ImuData> &imu_data, double time0, double time1,
                                                               bool warn) {
 
@@ -392,6 +409,15 @@ std::vector<ov_core::ImuData> Propagator::select_imu_readings(const std::vector<
   return prop_data;
 }
 
+/**
+ * @brief 预测状态并计算状态转移矩阵和过程噪声协方差
+ * 三种传播方式: 1. RK4积分 2. 欧拉积分 3. 精确积分 (Analytical Integration)
+ * @param state 滤波器的状态
+ * @param data_minus 上一时刻的IMU测量数据
+ * @param data_plus 当前时刻的IMU测量数据
+ * @param F 输出 状态转移矩阵
+ * @param Qd 输出 离散时间过程噪声协方差矩阵
+ */
 void Propagator::predict_and_compute(std::shared_ptr<State> state, const ov_core::ImuData &data_minus, const ov_core::ImuData &data_plus,
                                      Eigen::MatrixXd &F, Eigen::MatrixXd &Qd) {
 
@@ -400,16 +426,17 @@ void Propagator::predict_and_compute(std::shared_ptr<State> state, const ov_core
   // assert(data_plus.timestamp>data_minus.timestamp);
 
   // IMU intrinsic calibration estimates (static)
+  // 内参模型https://docs.openvins.com/propagation_analytical.html#imu_intrinsic_models
   Eigen::Matrix3d Dw = State::Dm(state->_options.imu_model, state->_calib_imu_dw->value());
   Eigen::Matrix3d Da = State::Dm(state->_options.imu_model, state->_calib_imu_da->value());
   Eigen::Matrix3d Tg = State::Tg(state->_calib_imu_tg->value());
 
-  // Corrected imu acc measurements with our current biases
+  // Corrected imu acc measurements with our current biases 零偏补偿
   Eigen::Vector3d a_hat1 = data_minus.am - state->_imu->bias_a();
   Eigen::Vector3d a_hat2 = data_plus.am - state->_imu->bias_a();
   Eigen::Vector3d a_hat_avg = .5 * (a_hat1 + a_hat2);
 
-  // Convert "raw" imu to its corrected frame using the IMU intrinsics
+  // Convert "raw" imu to its corrected frame using the IMU intrinsics 内参校准
   Eigen::Vector3d a_uncorrected = a_hat_avg;
   Eigen::Matrix3d R_ACCtoIMU = state->_calib_imu_ACCtoIMU->Rot();
   a_hat1 = R_ACCtoIMU * Da * a_hat1;
@@ -479,6 +506,17 @@ void Propagator::predict_and_compute(std::shared_ptr<State> state, const ov_core
   state->_imu->set_fej(imu_x);
 }
 
+/**
+ * @brief 使用离散时间模型预测IMU状态的均值(假设加速度和角速度在时间间隔dt内保持不变)
+ * 见https://docs.openvins.com/propagation_discrete.html
+ * @param state 滤波器状态
+ * @param dt 时间步长
+ * @param w_hat 校正后的角速度
+ * @param a_hat 校正后的加速度
+ * @param new_q 预测的四元数
+ * @param new_v 预测的速度
+ * @param new_p 预测的位置
+ */
 void Propagator::predict_mean_discrete(std::shared_ptr<State> state, double dt, const Eigen::Vector3d &w_hat, const Eigen::Vector3d &a_hat,
                                        Eigen::Vector4d &new_q, Eigen::Vector3d &new_v, Eigen::Vector3d &new_p) {
 
@@ -494,6 +532,7 @@ void Propagator::predict_mean_discrete(std::shared_ptr<State> state, double dt, 
   } else {
     bigO = I_4x4 + 0.5 * dt * Omega(w_hat);
   }
+  // 下面这两个公式两者在数学上是等价的，只是四元数版本避免了旋转矩阵→四元数的转换
   new_q = quatnorm(bigO * state->_imu->quat());
   // new_q = rot_2_quat(exp_so3(-w_hat*dt)*R_Gtoi);
 
@@ -585,6 +624,15 @@ void Propagator::predict_mean_rk4(std::shared_ptr<State> state, double dt, const
   new_v = v_0 + (1.0 / 6.0) * k1_v + (1.0 / 3.0) * k2_v + (1.0 / 3.0) * k3_v + (1.0 / 6.0) * k4_v;
 }
 
+/**
+ * @brief 计算Xi_sum矩阵，用于状态传播中的积分项
+ * 
+ * @param state 滤波器状态
+ * @param dt 时间步长
+ * @param w_hat 校正后的角速度
+ * @param a_hat 校正后的加速度
+ * @param Xi_sum 积分矩阵结果，用于状态传播中的积分项
+ */
 void Propagator::compute_Xi_sum(std::shared_ptr<State> state, double dt, const Eigen::Vector3d &w_hat, const Eigen::Vector3d &a_hat,
                                 Eigen::Matrix<double, 3, 18> &Xi_sum) {
 
