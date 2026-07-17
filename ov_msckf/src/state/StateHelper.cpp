@@ -33,6 +33,15 @@ using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
 
+/**
+ * @brief 传播状态协方差矩阵
+ * 只传播协方差、不传播均值
+ * @param state 
+ * @param order_NEW 
+ * @param order_OLD 
+ * @param Phi 
+ * @param Q 
+ */
 void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &order_NEW,
                                  const std::vector<std::shared_ptr<Type>> &order_OLD, const Eigen::MatrixXd &Phi,
                                  const Eigen::MatrixXd &Q) {
@@ -586,6 +595,13 @@ void StateHelper::initialize_invertible(std::shared_ptr<State> state, std::share
   // PRINT_DEBUG(ss.str().c_str());
 }
 
+/**
+ * @brief 状态克隆（clone）是指在滤波器中添加一个新的状态变量，该变量的初始值和协方差与现有状态变量相同。
+ * 这个函数实现了状态克隆的过程，并且在时间校准的情况下，还会根据IMU的角速度和线速度来调整协方差矩阵，以反映时间偏移对状态估计的不确定性影响。
+ * 
+ * @param state 
+ * @param last_w 
+ */
 void StateHelper::augment_clone(std::shared_ptr<State> state, Eigen::Matrix<double, 3, 1> last_w) {
 
   // We can't insert a clone that occured at the same timestamp!

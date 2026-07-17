@@ -91,6 +91,7 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
     for (size_t i = 0; i < prop_data.size() - 1; i++) {
 
       // Get the next state Jacobian and noise Jacobian for this IMU reading
+      // 计算从 prop_data.at(i) 到 prop_data.at(i+1) 的状态转移矩阵 F(Phi_i) 和离散噪声矩阵 Qdi
       Eigen::MatrixXd F, Qdi;
       predict_and_compute(state, prop_data.at(i), prop_data.at(i + 1), F, Qdi);
 
@@ -101,8 +102,8 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
       // NOTE: Phi_summed = Phi_i*Phi_summed
       // NOTE: Q_summed = Phi_i*Q_summed*Phi_i^T + G*Q_i*G^T
       Phi_summed = F * Phi_summed;
-      Qd_summed = F * Qd_summed * F.transpose() + Qdi;
-      Qd_summed = 0.5 * (Qd_summed + Qd_summed.transpose());
+      Qd_summed = F * Qd_summed * F.transpose() + Qdi; // 把此前噪声传播到当前时刻，再加入当前段新噪声
+      Qd_summed = 0.5 * (Qd_summed + Qd_summed.transpose()); // 强制保持对称
       dt_summed += prop_data.at(i + 1).timestamp - prop_data.at(i).timestamp;
     }
   }
@@ -462,7 +463,7 @@ void Propagator::predict_and_compute(std::shared_ptr<State> state, const ov_core
     compute_Xi_sum(state, dt, w_hat_avg, a_hat_avg, Xi_sum);
   }
 
-  // Compute the new state mean value
+  // Compute the new state mean value，计算新的状态均值
   Eigen::Vector4d new_q;
   Eigen::Vector3d new_v, new_p;
   if (state->_options.integration_method == StateOptions::IntegrationMethod::ANALYTICAL) {
@@ -626,22 +627,32 @@ void Propagator::predict_mean_rk4(std::shared_ptr<State> state, double dt, const
 
 /**
  * @brief 计算Xi_sum矩阵，用于状态传播中的积分项
- * 
+ * Xi_sum矩阵的计算见OpenVINS文档中的分析积分组件
+ * https://docs.openvins.com/propagation_analytical.html#analytical_integration_components
  * @param state 滤波器状态
  * @param dt 时间步长
  * @param w_hat 校正后的角速度
  * @param a_hat 校正后的加速度
  * @param Xi_sum 积分矩阵结果，用于状态传播中的积分项
+ * 通过将这些积分项统一在该函数中计算并缓存为 Xi_sum 矩阵，有效避免了重复的三角函数和矩阵指数运算。
+ * Xi_sum矩阵的维度为3x18，包含了旋转和加速度的积分项，用于计算状态传播中的均值和协方差
+ * Ξ_sum = [ 𝐑ᵏ⁺¹ₖ  Ξ₁  Ξ₂  𝐉ᵣ  Ξ₃  Ξ₄ ]
+ * 𝐑ᵏ⁺¹ₖ(R_ktok1): 从 k 时刻到 k + 1 时刻的相对旋转矩阵,用于更新 IMU 的姿态状态
+ * Ξ₁(Xi_1): 一阶旋转积分项,用于预测 k + 1 时刻的速度平均值
+ * Ξ₂(Xi_2): 二阶旋转积分项,用于预测 k + 1 时刻的位置平均值
+ * 𝐉ᵣ(Jr_ktok1): SO(3) 的右雅可比矩阵,描述旋转对角速度微小变化的雅可比，主要用在误差状态转移矩阵（F）中关于陀螺仪零偏（Gyro Bias）的计算上
+ * Ξ₃(Xi_3): 一阶“旋转-加速度”交叉积分。在计算误差转移矩阵时，用于描述速度误差对陀螺仪零偏误差的雅可比贡献（即旋转扰动如何通过加速度计测量影响速度）
+ * Ξ₄(Xi_4): 二阶“旋转-加速度”交叉积分。在计算误差转移矩阵时，用于描述位置误差对陀螺仪零偏误差的雅可比贡献（即旋转扰动如何通过加速度计测量影响位置）
  */
 void Propagator::compute_Xi_sum(std::shared_ptr<State> state, double dt, const Eigen::Vector3d &w_hat, const Eigen::Vector3d &a_hat,
                                 Eigen::Matrix<double, 3, 18> &Xi_sum) {
 
   // Decompose our angular velocity into a direction and amount
-  double w_norm = w_hat.norm();
-  double d_th = w_norm * dt;
+  double w_norm = w_hat.norm(); // 旋转角速度的模长
+  double d_th = w_norm * dt; // 旋转角度增量
   Eigen::Vector3d k_hat = Eigen::Vector3d::Zero();
   if (w_norm > 1e-12) {
-    k_hat = w_hat / w_norm;
+    k_hat = w_hat / w_norm; // 旋转轴单位向量
   }
 
   // Compute useful identities used throughout
@@ -665,6 +676,11 @@ void Propagator::compute_Xi_sum(std::shared_ptr<State> state, double dt, const E
 
   // Now begin the integration of each component
   // Based on the delta theta, let's decide which integration will be used
+  // 根据旋转角速度的大小，使用了分流处理以保证数值稳定性
+  // 1. 当角速度较大时,直接使用闭式的三角函数解析公式计算 Ξ₁ 至 Ξ₄。
+  // 由于分母含有 Vert boldsymbol ω Vert 的高次方（最高至 Vert boldsymbol ω Vert³），
+  // 当角速度接近 0 时会发生数值溢出或剧烈抖动
+  // 2. 当角速度较小时,使用了泰勒展开式近似计算 Ξ₁ 至 Ξ₄，避免了除以小数带来的数值不稳定问题。
   bool small_w = (w_norm < 1.0 / 180 * M_PI / 2);
   if (!small_w) {
 
@@ -703,6 +719,7 @@ void Propagator::compute_Xi_sum(std::shared_ptr<State> state, double dt, const E
   }
 
   // Store the integrated parameters
+  // 存储的都是解析积分的结果                                                                                                                                                                                             
   Xi_sum.setZero();
   Xi_sum.block(0, 0, 3, 3) = R_ktok1;
   Xi_sum.block(0, 3, 3, 3) = Xi_1;
@@ -712,6 +729,18 @@ void Propagator::compute_Xi_sum(std::shared_ptr<State> state, double dt, const E
   Xi_sum.block(0, 15, 3, 3) = Xi_4;
 }
 
+/**
+ * @brief 计算解析积分的状态均值预测
+ * 
+ * @param state 
+ * @param dt 
+ * @param w_hat 
+ * @param a_hat 
+ * @param new_q 
+ * @param new_v 
+ * @param new_p 
+ * @param Xi_sum 
+ */
 void Propagator::predict_mean_analytic(std::shared_ptr<State> state, double dt, const Eigen::Vector3d &w_hat, const Eigen::Vector3d &a_hat,
                                        Eigen::Vector4d &new_q, Eigen::Vector3d &new_v, Eigen::Vector3d &new_p,
                                        Eigen::Matrix<double, 3, 18> &Xi_sum) {
@@ -728,6 +757,23 @@ void Propagator::predict_mean_analytic(std::shared_ptr<State> state, double dt, 
   new_p = state->_imu->pos() + state->_imu->vel() * dt + R_Gtok.transpose() * Xi_2 * a_hat - 0.5 * _gravity * dt * dt;
 }
 
+/**
+ * @brief 计算状态转移矩阵F和过程噪声输入矩阵G的解析表达式
+ * 计算F和G的解析表达式见OpenVINS文档中的分析线性化部分
+ * https://docs.openvins.com/propagation_analytical.html#analytical_linearization
+ * @param state 
+ * @param dt 
+ * @param w_hat 
+ * @param a_hat 
+ * @param w_uncorrected 
+ * @param a_uncorrected 
+ * @param new_q 
+ * @param new_v 
+ * @param new_p 
+ * @param Xi_sum 
+ * @param F 
+ * @param G 
+ */
 void Propagator::compute_F_and_G_analytic(std::shared_ptr<State> state, double dt, const Eigen::Vector3d &w_hat,
                                           const Eigen::Vector3d &a_hat, const Eigen::Vector3d &w_uncorrected,
                                           const Eigen::Vector3d &a_uncorrected, const Eigen::Vector4d &new_q, const Eigen::Vector3d &new_v,
@@ -875,6 +921,22 @@ void Propagator::compute_F_and_G_analytic(std::shared_ptr<State> state, double d
   G.block(ba_id, 9, 3, 3) = dt * Eigen::Matrix3d::Identity();
 }
 
+/**
+ * @brief 计算状态转移矩阵F和过程噪声矩阵G的离散版本
+ * F和G的计算见OpenVINS文档中的误差传播部分
+ * https://docs.openvins.com/propagation_discrete.html#error_prop 
+ * @param state 
+ * @param dt 
+ * @param w_hat 
+ * @param a_hat 
+ * @param w_uncorrected 
+ * @param a_uncorrected 
+ * @param new_q 
+ * @param new_v 
+ * @param new_p 
+ * @param F 
+ * @param G 
+ */
 void Propagator::compute_F_and_G_discrete(std::shared_ptr<State> state, double dt, const Eigen::Vector3d &w_hat,
                                           const Eigen::Vector3d &a_hat, const Eigen::Vector3d &w_uncorrected,
                                           const Eigen::Vector3d &a_uncorrected, const Eigen::Vector4d &new_q, const Eigen::Vector3d &new_v,

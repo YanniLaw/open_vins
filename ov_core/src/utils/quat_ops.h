@@ -81,7 +81,9 @@ namespace ov_core {
  *  2(q_1q_3+q_2q_4) & 2(q_2q_3-q_1q_4) & -q_1^2-q_2^2+q_3^2+q_4^2
  *  \end{bmatrix}
  * \f}
- *
+ * 采用了工程中非常经典的“最大元素法”（Maximum Element Method）来保证数值稳定性
+ * 通过分别判断对角元素R00，R11，R22哪个最大，来决定先算 x、y、z 还是 w
+ * 谁的绝对值大，就先算谁，从而确保分母总是足够大，彻底避免除以零的问题
  * @param[in] rot 3x3 rotation matrix
  * @return 4x1 quaternion
  */
@@ -145,7 +147,8 @@ inline Eigen::Matrix<double, 3, 3> skew_x(const Eigen::Matrix<double, 3, 1> &w) 
  * \f{align*}{
  *  \mathbf{R} = (2q_4^2-1)\mathbf{I}_3-2q_4\lfloor\mathbf{q}\times\rfloor+2\mathbf{q}\mathbf{q}^\top
  * @f}
- *
+ * R(q)= (2q4^2-1)I_3x3 - 2q4[q×] + 2qq^T   [q×] 是skew-symmetric反对称矩阵
+ * 或者等价 R(q) = (q4^2 -q^Tq)I_3x3 - 2q4[q×] + 2qq^T
  * @param[in] q JPL quaternion [x, y, z, w]
  * @return 3x3 SO(3) rotation matrix
  */
@@ -172,7 +175,8 @@ inline Eigen::Matrix<double, 3, 3> quat_2_Rot(const Eigen::Matrix<double, 4, 1> 
  *  \mathbf{p} \\ p_4
  *  \end{bmatrix}
  * @f}
- *
+ * q x p = L(q)p = | q4*I_3x3 - [q×],   q  |   | p  |
+ *                 |       -q^T,        q4 | * | p4 |
  * @param[in] q First JPL quaternion
  * @param[in] p Second JPL quaternion
  * @return 4x1 resulting q*p quaternion
@@ -187,18 +191,21 @@ inline Eigen::Matrix<double, 4, 1> quat_multiply(const Eigen::Matrix<double, 4, 
   Qm(3, 3) = q(3, 0);
   q_t = Qm * p;
   // ensure unique by forcing q_4 to be >0
-  if (q_t(3, 0) < 0) {
+  if (q_t(3, 0) < 0) { // 四元数具有双覆盖性(q和-q表示相同的旋转)，强制q_4>=0保证唯一性
     q_t *= -1;
   }
   // normalize and return
-  return q_t / q_t.norm();
+  return q_t / q_t.norm(); // 确保四元数严格在单位圆上，消除浮点累积误差
 }
 
 /**
  * @brief Returns vector portion of skew-symmetric
- *
+ * vee (v) 是 hat(^) 的逆运算，将反对称矩阵转为向量
  * See skew_x() for details.
- *
+ * w_x^ = | 0   -w3  w2 |
+ *        | w3   0  -w1 |
+ *        | -w2  w1  0  |
+ * 这里分别取w1(第三行第二列), w2(第一行第三列), w3(第二行第一列)的值
  * @param[in] w_x skew-symmetric matrix
  * @return 3x1 vector portion of skew
  */
