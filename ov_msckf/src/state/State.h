@@ -61,11 +61,13 @@ public:
    * @brief Will return the timestep that we will marginalize next.
    * As of right now, since we are using a sliding window, this is the oldest clone.
    * But if you wanted to do a keyframe system, you could selectively marginalize clones.
-   * @return timestep of clone we will marginalize
+   * @return timestep of clone we will marginalize， or INFINITY if we have no clones
    */
   double margtimestep() {
     std::lock_guard<std::mutex> lock(_mutex_state);
-    double time = INFINITY;
+    double time = INFINITY; // 正无穷大
+    // 遍历所有克隆状态，找到最早的时间戳作为边缘化时间
+    // 这里_clones_IMU是一个map，时间戳按理说是有序的，但为了保险起见，还是遍历一遍找最小值
     for (const auto &clone_imu : _clones_IMU) {
       if (clone_imu.first < time) {
         time = clone_imu.first;

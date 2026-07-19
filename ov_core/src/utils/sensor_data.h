@@ -48,7 +48,7 @@ struct ImuData {
 
 /**
  * @brief Struct for a collection of camera measurements.
- * openvins支持多相机系统，每个CameraData实例可以包含来自多个相机的图像数据。
+ * openvins支持多相机系统(要不是多个单目，要不是一个双目)，每个CameraData实例可以表示一帧单目数据，也可以表示一帧双目数据。
  * 每个图像数据都与一个唯一的相机ID相关联，以便在处理时区分不同的相机数据流。
  * 该结构体包含一个时间戳、一个相机ID列表和一个图像列表。
  * 时间戳表示图像数据的采集时间，相机ID列表用于标识不同的相机数据流，而图像列表则包含了来自各个相机的图像数据。
@@ -58,7 +58,7 @@ struct ImuData {
  */
 struct CameraData {
 
-  /// Timestamp of the reading
+  /// Timestamp of the reading，唯一的时间戳，表示图像数据的采集时间
   double timestamp;
 
   /// Camera ids for each of the images collected

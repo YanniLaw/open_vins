@@ -53,7 +53,8 @@ void TrackKLT::feed_new_camera(const CameraData &message) {
     size_t cam_id = message.sensor_ids.at(msg_id);
     std::lock_guard<std::mutex> lck(mtx_feeds.at(cam_id));
 
-    // Histogram equalize
+    // Histogram equalize 
+    // 图像预处理，直方图均衡化，增强图像对比度
     cv::Mat img;
     if (histogram_method == HistogramMethod::HISTOGRAM) {
       cv::equalizeHist(message.images.at(msg_id), img);

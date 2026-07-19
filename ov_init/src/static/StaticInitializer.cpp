@@ -147,13 +147,14 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
   // 根据静止的前半段估计陀螺仪和加速度计零偏
   Eigen::Vector3d gravity_inG;
   gravity_inG << 0.0, 0.0, params.gravity_mag;
-  Eigen::Vector3d bg = w_avg_2to1;
-  Eigen::Vector3d ba = a_avg_2to1 - quat_2_Rot(q_GtoI) * gravity_inG;
+  Eigen::Vector3d bg = w_avg_2to1; // 陀螺仪零偏 = 前半段陀螺仪均值
+  Eigen::Vector3d ba = a_avg_2to1 - quat_2_Rot(q_GtoI) * gravity_inG; // 加速度计零偏 = 前半段加速度计均值 - 重力在传感器坐标系下的映射
 
   // Set our state variables
-  timestamp = window_2to1.at(window_2to1.size() - 1).timestamp; // 使用前半段最后一个测量的时间戳(因为在这段时间都是静止的)
+  // 使用前半段最后一个测量的时间戳作为整个系统静止初始化成功的时间戳(因为在这段时间都是静止的)
+  timestamp = window_2to1.at(window_2to1.size() - 1).timestamp;
   Eigen::VectorXd imu_state = Eigen::VectorXd::Zero(16);
-  imu_state.block(0, 0, 4, 1) = q_GtoI;
+  imu_state.block(0, 0, 4, 1) = q_GtoI; // 静止初始化只更新姿态，位置和速度保持为零，陀螺仪和加速度计零偏根据前半段均值估计
   imu_state.block(10, 0, 3, 1) = bg;
   imu_state.block(13, 0, 3, 1) = ba;
   assert(t_imu != nullptr);
@@ -163,7 +164,7 @@ bool StaticInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarianc
   // Create base covariance and its covariance ordering
   order.clear();
   order.push_back(t_imu);
-  covariance = std::pow(0.02, 2) * Eigen::MatrixXd::Identity(t_imu->size(), t_imu->size());
+  covariance = std::pow(0.02, 2) * Eigen::MatrixXd::Identity(t_imu->size(), t_imu->size()); // 15 x 15
   covariance.block(0, 0, 3, 3) = std::pow(0.02, 2) * Eigen::Matrix3d::Identity(); // q
   covariance.block(3, 3, 3, 3) = std::pow(0.05, 2) * Eigen::Matrix3d::Identity(); // p
   covariance.block(6, 6, 3, 3) = std::pow(0.01, 2) * Eigen::Matrix3d::Identity(); // v (static)

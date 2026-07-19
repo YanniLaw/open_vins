@@ -228,10 +228,43 @@ void StateHelper::set_initial_covariance(std::shared_ptr<State> state, const Eig
   // Note: this copies over itself to when i_index=k_index
   // 它不是“重建整个协方差”，而是“把你指定变量集合的协方差块覆盖进去”。
   // 未在 order 里的其他变量块保持原值不动
+
+  /*  假设状态向量为 x = [q, p, v, bg, ba, dw, da, dt]，但初始化器只估计了 order = {imu(q, p, v, bg, ba)}
+      全局协方差（初始化前）:
+          q  p  v  bg ba dw da dt
+      q  [0  0  0  0  0  0  0  0]
+      p  [0  0  0  0  0  0  0  0]
+      v  [0  0  0  0  0  0  0  0]
+      bg [0  0  0  0  0  0  0  0]
+      ba [0  0  0  0  0  0  0  0]
+      dw [0  0  0  0  0  0  0  0]
+      da [0  0  0  0  0  0  0  0]
+      dt [0  0  0  0  0  0  0  0]
+
+      初始化器给出的局部协方差（order = {q, p, v, bg, ba}）:
+           q    p    v    bg    ba
+      q  [Pqq  Pqp  Pqv  Pqbg  Pqba]
+      p  [Ppq  Ppp  Ppv  Ppbg  Ppba]
+      v  [Pvq  Pvp  Pvv  Pvbg  Pvba]
+      bg [Pbgq Pbgp Pbgv Pbgbg Pbgba]
+      ba [Pbqa Pbap Pbav Pbabg Pgaba]
+
+      覆盖后的全局协方差:
+           q    p    v    bg    ba  dw da dt
+      q  [Pqq  Pqp  Pqv  Pqbg  Pqba  0  0  0]
+      p  [Ppq  Ppp  Ppv  Ppbg  Ppba  0  0  0]
+      v  [Pvq  Pvp  Pvv  Pvbg  Pvba  0  0  0]
+      bg [Pbgq Pbgp Pbgv Pbgbg Pbgba 0  0  0]
+      ba [Pbqa Pbap Pbav Pbabg Pbaba 0  0  0]
+      dw [ 0    0    0     0     0   0  0  0]   ← 不动
+      da [ 0    0    0     0     0   0  0  0]   ← 不动
+      dt [ 0    0    0     0     0   0  0  0]   ← 不动 
+  */
   int i_index = 0;
   for (size_t i = 0; i < order.size(); i++) {
     int k_index = 0;
     for (size_t k = 0; k < order.size(); k++) {
+      // order[i]->id() 是变量在全局状态向量中的起始位置，i_index 是其在局部协方差中的起始位置
       state->_Cov.block(order[i]->id(), order[k]->id(), order[i]->size(), order[k]->size()) =
           covariance.block(i_index, k_index, order[i]->size(), order[k]->size());
       k_index += order[k]->size();

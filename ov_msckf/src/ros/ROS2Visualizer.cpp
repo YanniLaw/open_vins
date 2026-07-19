@@ -497,7 +497,7 @@ void ROS2Visualizer::callback_inertial(const sensor_msgs::msg::Imu::SharedPtr ms
   message.am << msg->linear_acceleration.x, msg->linear_acceleration.y, msg->linear_acceleration.z;
 
   // send it to our VIO system
-  _app->feed_measurement_imu(message); // 喂入IMU测量数据到VIO系统
+  _app->feed_measurement_imu(message); // 喂入IMU测量数据到VIO系统(并清理掉太久的IMU数据)
   visualize_odometry(message.timestamp); // 需要初始化完成之后才会进行
 
   // If the processing queue is currently active / running just return so we can keep getting measurements
@@ -513,6 +513,7 @@ void ROS2Visualizer::callback_inertial(const sensor_msgs::msg::Imu::SharedPtr ms
 
     // Count how many unique image streams 统计队列中有多少种不同相机ID
     // 对于双目：等价为1路（同步后合并）sensor_ids [0,1]；单目N路：要N路都有数据
+    // 该系统只支持一个双目，或者多个单目相机的情况，不能同时有双目和单目或者多个双目的情况
     std::map<int, bool> unique_cam_ids;
     for (const auto &cam_msg : camera_queue) {
       unique_cam_ids[cam_msg.sensor_ids.at(0)] = true; // cam_msg.sensor_ids.at(0)
@@ -526,7 +527,9 @@ void ROS2Visualizer::callback_inertial(const sensor_msgs::msg::Imu::SharedPtr ms
 
       // Loop through our queue and see if we are able to process any of our camera measurements
       // We are able to process if we have at least one IMU measurement greater than the camera time
+      // t_imu = t_cam + calib_dt , 这里的message.timestamp 是当前传入的IMU的时间戳
       double timestamp_imu_inC = message.timestamp - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
+      // 处理相机测量数据，只要队列不为空 并且IMU时间戳覆盖了队列中最老的相机时间戳，就可以开始处理队列中的相机测量数据(顺序处理)
       while (!camera_queue.empty() && camera_queue.at(0).timestamp < timestamp_imu_inC) {
         auto rT0_1 = boost::posix_time::microsec_clock::local_time();
         double update_dt = 100.0 * (timestamp_imu_inC - camera_queue.at(0).timestamp);

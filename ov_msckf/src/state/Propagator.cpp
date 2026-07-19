@@ -146,10 +146,22 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
   StateHelper::augment_clone(state, last_w);
 }
 
+/**
+ * @brief Fast state propagation using IMU measurements without updating the state covariance.
+ * 快速预测（而非完整传播）系统状态到未来某个时间点。它不会修改主状态（State），而是返回一个预测的副本。
+ * 典型用途是提供高频位姿估计（例如在两帧图像之间，为用户提供 IMU 频率的实时位姿）。
+ * @param state 估计的系统状态（State），包含当前的位姿、速度、偏置等信息。
+ * @param timestamp 预测的目标时间戳。
+ * @param state_plus 返回的预测状态增量。
+ * @param covariance 返回的预测协方差。
+ * @return true 如果成功进行预测。
+ * @return false 如果预测失败（例如IMU数据不足）。
+ */
 bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double timestamp, Eigen::Matrix<double, 13, 1> &state_plus,
                                       Eigen::Matrix<double, 12, 12> &covariance) {
 
   // First we will store the current calibration / estimates of the state
+  // 首次调用时将当前 IMU 状态、协方差和时间戳等存入缓存，后续调用直接从缓存的上次预测位置继续传播，无需每次重新读取主状态。
   if (!cache_imu_valid) {
     cache_state_time = state->_timestamp;
     cache_state_est = state->_imu->value();
@@ -158,7 +170,7 @@ bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double times
     cache_imu_valid = true;
   }
 
-  // First lets construct an IMU vector of measurements we need
+  // First lets construct an IMU vector of measurements we need，先补偿时间偏移
   double time0 = cache_state_time + cache_t_off;
   double time1 = timestamp + cache_t_off;
   std::vector<ov_core::ImuData> prop_data;
@@ -182,6 +194,7 @@ bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double times
 
   // Loop through all IMU messages, and use them to move the state forward in time
   // This uses the zero'th order quat, and then constant acceleration discrete
+  // 采用离散积分方法，使用零阶四元数近似和恒定加速度假设，将状态传播到目标时间戳
   for (size_t i = 0; i < prop_data.size() - 1; i++) {
 
     // Time elapsed over interval
@@ -200,9 +213,9 @@ bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double times
     Eigen::Vector3d w_hat = 0.5 * (w_hat1 + w_hat2);
 
     // Current state estimates
-    Eigen::Matrix3d R_Gtoi = quat_2_Rot(cache_state_est.block(0, 0, 4, 1));
-    Eigen::Vector3d v_iinG = cache_state_est.block(7, 0, 3, 1);
-    Eigen::Vector3d p_iinG = cache_state_est.block(4, 0, 3, 1);
+    Eigen::Matrix3d R_Gtoi = quat_2_Rot(cache_state_est.block(0, 0, 4, 1)); // 四元数 global to imu frame
+    Eigen::Vector3d v_iinG = cache_state_est.block(7, 0, 3, 1); // v in global frame
+    Eigen::Vector3d p_iinG = cache_state_est.block(4, 0, 3, 1); // p in global frame
 
     // State transition and noise matrix
     // TODO: should probably track the correlations with the IMU intrinsics if we are calibrating
@@ -235,11 +248,11 @@ bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double times
     Qc.block(3, 3, 3, 3) = _noises.sigma_a_2 / dt * Eigen::Matrix3d::Identity();
     Qc.block(6, 6, 3, 3) = _noises.sigma_wb_2 * dt * Eigen::Matrix3d::Identity();
     Qc.block(9, 9, 3, 3) = _noises.sigma_ab_2 * dt * Eigen::Matrix3d::Identity();
-    Qd = G * Qc * G.transpose();
+    Qd = G * Qc * G.transpose(); // 离散化噪声协方差
     Qd = 0.5 * (Qd + Qd.transpose());
-    cache_state_covariance = F * cache_state_covariance * F.transpose() + Qd;
+    cache_state_covariance = F * cache_state_covariance * F.transpose() + Qd; // imu的协方差传播
 
-    // Propagate the mean forward
+    // Propagate the mean forward，imu均值传播
     cache_state_est.block(0, 0, 4, 1) = rot_2_quat(exp_so3(-w_hat * dt) * R_Gtoi);
     cache_state_est.block(4, 0, 3, 1) = p_iinG + v_iinG * dt + 0.5 * R_Gtoi.transpose() * a_hat * dt * dt - 0.5 * _gravity * dt * dt;
     cache_state_est.block(7, 0, 3, 1) = v_iinG + R_Gtoi.transpose() * a_hat * dt - _gravity * dt;

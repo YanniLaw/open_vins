@@ -260,6 +260,11 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
   do_feature_propagate_update(message);
 }
 
+/**
+ * @brief Track the incoming camera image and update the VIO state accordingly.
+ * 
+ * @param message_const 接收到的相机测量数据，包含时间戳、相机ID、图像数据和掩码（如果使用）按时间顺序处理
+ */
 void VioManager::track_image_and_update(const ov_core::CameraData &message_const) {
 
   // Start timing
@@ -272,7 +277,7 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     assert(message_const.sensor_ids.at(i) != message_const.sensor_ids.at(i + 1));
   }
 
-  // Downsample if we are downsampling
+  // Downsample if we are downsampling，降采样
   ov_core::CameraData message = message_const;
   for (size_t i = 0; i < message.sensor_ids.size() && params.downsample_cameras; i++) {
     cv::Mat img = message.images.at(i);

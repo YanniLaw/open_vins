@@ -80,14 +80,22 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
   // Directly return if the initialization thread is running
   // Note that we lock on the queue since we could have finished an update
   // And are using this queue to propagate the state forward. We should wait in this case
-  // 如果初始化线程正在运行，则直接返回false
+  // 核心设计思想：初始化是耗时操作，不能阻塞主线程接收 IMU/相机数据。camera_queue_init 作为"缓冲区"，
+  // 让初始化完成后能快速追上当前时间，而不是从初始化时刻一帧帧重新处理所有丢弃的帧。
+
+  // 初始化可能需要几百毫秒到几秒（收集足够的 IMU/Jerk 数据），但是在这段时间内新的相机帧仍在不断到来。
+  // 当初始化线程已经在运行时，后续每一帧camera运行到 try_to_initialize 时都会把当前帧的时间戳缓存起来(避免数据丢失)，
+  // 同时会返回 false，导致这些帧在 track_image_and_update 中被直接跳过。
+  // 如果初始化成功，则缓存的时间戳会被依次处理。用缓存时间戳快速前推状态到最新时刻（按 clone_rate 跳步，不逐帧做全量更新）
+  // 如果初始化失败，则clear() 清空缓存，下次重试从头开始。
+
   if (thread_init_running) {
     std::lock_guard<std::mutex> lck(camera_queue_init_mtx);
     camera_queue_init.push_back(message.timestamp); // 缓存当前时间戳
     return false;
   }
 
-  // If the thread was a success, then return success! 初始化成功了也直接返回成功
+  // If the thread was a success, then return success! 初始化成功了也直接返回成功，避免第二次初始化
   if (thread_init_success) {
     return true;
   }
@@ -160,7 +168,7 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
 
       // Remove any camera times that are order then the initialized time
       // This can happen if the initialization has taken a while to perform
-      // 把系统从“初始化完成时刻”快速推进到“当前前端时间”，减少初始化线程造成的时间落后
+      // 把系统从“初始化完成时刻”快速推进到“当前前端时间”(当前初始化线程执行时前面一直在缓存最新camera时间戳)，减少初始化线程造成的时间落后
       // 初始化可能花了几百毫秒到几秒，这段时间新来的图像时间戳先被缓存了，现在要把这些“晚于初始化时刻”的帧用于状态前推
       // 早于等于 timestamp 的时刻会被丢弃，因为状态已经在那个时间点上了
       std::lock_guard<std::mutex> lck(camera_queue_init_mtx);
@@ -175,9 +183,22 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
       // Now we have initialized we will propagate the state to the current timestep
       // In general this should be ok as long as the initialization didn't take too long to perform
       // Propagating over multiple seconds will become an issue if the initial biases are bad
-      // 目的不是每一帧都 clone，而是按步长跳着取，避免一次性加太多 clone 让状态爆炸
+      // 目的不是每一帧都 clone，而是按步长跳着取，避免一次性加太多 clone 让状态爆炸，
+      // 其实如果缓存的时间戳不超过 max_clone_size，那么每个时间戳都会去处理的
+      // 因为缓存的时间戳数量可能远大于滑窗容量（如 10 秒视频对应 300 帧，但 max_clone_size 可能只有 15 个）
+      // 不用每帧都做完整传播+克隆，而是等间隔跳取，使克隆数量受控，每传播一帧后立即 marginalize_old_clone() 保证不超过最大数量
+
+      // Note: 为什么不做完整更新而只做传播？
+      // 初始化线程内部没有执行 do_feature_propagate_update 的完整流程（MSCKF/SLAM 更新、重新三角化等），原因：
+      // 缓存帧的特征已被丢弃：初始化时已经 cleanup_measurements(timestamp)，缓存帧对应的特征观测数据已被清理
+      // 避免重复计算：完整的 MSCKF/SLAM 更新计算量大，追赶时做全量更新是浪费
+      // 尽快交付状态：追赶的目的是让状态时间尽快对齐到当前时刻，后续正常帧会做完整的更新
+      // 追赶完成后，下一帧正常相机到来时，track_image_and_update 中的 do_feature_propagate_update 才会执行完整的传播+更新+三角化+边缘化流程。
+
       size_t clone_rate = (size_t)((double)camera_timestamps_to_init.size() / (double)params.state_options.max_clone_size) + 1;
       for (size_t i = 0; i < camera_timestamps_to_init.size(); i += clone_rate) {
+        // 从当前状态时间，利用缓存的 IMU 数据，将 IMU 状态（姿态、速度、位置）前推到缓存帧的时间点
+        // 同时传播协方差，更新状态转移和噪声累积
         propagator->propagate_and_clone(state, camera_timestamps_to_init.at(i));
         StateHelper::marginalize_old_clone(state); // 如果 clone 超过上限，立即边缘化最老的，保持滑窗大小受控
       }
@@ -190,7 +211,7 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
       PRINT_DEBUG(YELLOW "[init]: failed initialization in %.4f seconds\n" RESET, (init_rT2 - init_rT1).total_microseconds() * 1e-6);
       thread_init_success = false;
       std::lock_guard<std::mutex> lck(camera_queue_init_mtx);
-      camera_queue_init.clear();
+      camera_queue_init.clear(); // 如果初始化失败，则清空缓存，下次重试从头开始
     }
 
     // Finally, mark that the thread has finished running
