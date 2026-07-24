@@ -175,10 +175,11 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
       std::vector<double> camera_timestamps_to_init;
       // camera_queue_init是调用try_to_initialize时缓存的相机时间戳(如果当前线程花了很久才完成初始化的话，这些时间戳会被缓存起来)
       for (size_t i = 0; i < camera_queue_init.size(); i++) {
-        if (camera_queue_init.at(i) > timestamp) { // 将初始化时刻之后的相机时间戳加入待初始化列表
+        if (camera_queue_init.at(i) > timestamp) { // 将初始化时刻之后的相机时间戳加入待初始化列表，方便后面传播
           camera_timestamps_to_init.push_back(camera_queue_init.at(i));
         }
       }
+      // TODO: camera_queue_init_mtx 这个锁的范围一直到传播结束，是否有必要用camera_timestamps_to_init?
 
       // Now we have initialized we will propagate the state to the current timestep
       // In general this should be ok as long as the initialization didn't take too long to perform

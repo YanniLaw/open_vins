@@ -482,7 +482,12 @@ inline Eigen::Matrix<double, 4, 1> Inv(Eigen::Matrix<double, 4, 1> q) {
  * -\boldsymbol{\omega}^\top & 0
  * \end{bmatrix}
  * \f}
- *
+ * 因为四元数时间倒数的公式是 q_dot = 1/2 * Ω(ω) * q 
+ * 
+ * Ω(ω) = | -[ω]x   ω | = |  0    wz  -wy   wx |
+ *        |  -ω^T   0 |   | -wz   0    wx   wy |
+ *                        |  wy  -wx   0    wz |
+ *                        | -wx  -wy  -wz   0  |
  * @param w Angular velocity
  * @return The matrix \f$\boldsymbol{\Omega}\f$
  */

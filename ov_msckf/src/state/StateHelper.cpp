@@ -36,11 +36,11 @@ using namespace ov_msckf;
 /**
  * @brief 传播状态协方差矩阵
  * 只传播协方差、不传播均值
- * @param state 
- * @param order_NEW 
- * @param order_OLD 
- * @param Phi 
- * @param Q 
+ * @param state     滤波器状态
+ * @param order_NEW 传播后的状态块
+ * @param order_OLD 传播前的状态块
+ * @param Phi       状态转移矩阵
+ * @param Q         过程噪声协方差矩阵，是一个方阵
  */
 void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &order_NEW,
                                  const std::vector<std::shared_ptr<Type>> &order_OLD, const Eigen::MatrixXd &Phi,
@@ -53,6 +53,7 @@ void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector
   }
 
   // Loop through our Phi order and ensure that they are continuous in memory
+  // 确保参与传播的状态变量在全局状态向量中是连续存储的，这是块操作正确性的前提
   int size_order_NEW = order_NEW.at(0)->size();
   for (size_t i = 0; i < order_NEW.size() - 1; i++) {
     if (order_NEW.at(i)->id() + order_NEW.at(i)->size() != order_NEW.at(i + 1)->id()) {
@@ -78,7 +79,7 @@ void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector
 
   // Get the location in small phi for each measuring variable
   int current_it = 0;
-  std::vector<int> Phi_id;
+  std::vector<int> Phi_id;  // Phi_id 记录了每个 order_OLD 中的变量在 Φ 矩阵中对应的列起始位置
   for (const auto &var : order_OLD) {
     Phi_id.push_back(current_it);
     current_it += var->size();
@@ -94,6 +95,7 @@ void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector
   }
 
   // Get Phi_NEW*Covariance*Phi_NEW^t + Q
+  // 从矩阵 Q 的上三角部分构建一个完整的对称矩阵，并将结果存储到 Phi_Cov_PhiT 中
   Eigen::MatrixXd Phi_Cov_PhiT = Q.selfadjointView<Eigen::Upper>();
   for (size_t i = 0; i < order_OLD.size(); i++) {
     std::shared_ptr<Type> var = order_OLD.at(i);
@@ -109,6 +111,7 @@ void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector
   state->_Cov.block(start_id, start_id, phi_size, phi_size) = Phi_Cov_PhiT;
 
   // We should check if we are not positive semi-definitate (i.e. negative diagionals is not s.p.d)
+  // 提取矩阵 state->_Cov 的主对角线元素，并将它们复制到一个新的动态双精度向量 diags 中
   Eigen::VectorXd diags = state->_Cov.diagonal();
   bool found_neg = false;
   for (int i = 0; i < diags.rows(); i++) {

@@ -32,15 +32,16 @@ using namespace ov_msckf;
 
 /**
  * @brief Propagates the state forward in time using IMU measurements and clones the state at the specified timestamp.
- * 
- * @param state The current state of the system to be propagated.
- * @param timestamp The timestamp at which to clone the propagated state.
+ * 用IMU测量值将状态向前传播到指定时间戳，并在该时间戳克隆状态。
+ * @param state The current state of the system to be propagated.系统主状态，包含IMU状态、克隆状态等
+ * @param timestamp The timestamp at which to clone the propagated state.这个时间戳也就是相机的时间戳
  * @note The function will crash if attempting to propagate to the same timestamp or backwards in time.
  */
 void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timestamp) {
 
   // If the difference between the current update time and state is zero
   // We should crash, as this means we would have two clones at the same time!!!!
+  // 时间戳一致会导致两个相同时刻的克隆状态，无法区分
   if (state->_timestamp == timestamp) {
     PRINT_ERROR(RED "Propagator::propagate_and_clone(): Propagation called again at same timestep at last update timestep!!!!\n" RESET);
     std::exit(EXIT_FAILURE);
@@ -67,20 +68,84 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
   double t_off_new = state->_calib_dt_CAMtoIMU->value()(0);
 
   // First lets construct an IMU vector of measurements we need
-  // 从 IMU 缓冲区选取 [time0, time1] 区间内的所有测量值并自动处理边界处的插值
-  double time0 = state->_timestamp + last_prop_time_offset;
-  double time1 = timestamp + t_off_new;
+  // 为什么这样设计？核心在于保持传播区间的连续性，time0 必须精确对应上次传播实际结束的 IMU 时刻，而不是理论上的新偏移值
+  // 因为t_imu = t_cam + calib_dt，这里calib_dt是正在在线校准的时间偏移量
+  // 相机时间轴:  state._timestamp (上一帧)              timestamp (当前帧)
+  //                     │                                      │
+  //                     ▼                                      ▼
+  // IMU时间轴:  state._timestamp + last_prop_offset    timestamp + t_off_new
+  //                     ▲                                      ▲
+  //                     │                                      │
+  //                    time0                                 time1
+  //                     │◄────── 传播区间（IMU时基）───────────►│
+  // 为什么time0要用last_prop_time_offset而不是t_off_new？
+  // 因为上次传播真正结束的时刻就是 state->_timestamp + last_prop_time_offset
+  // 如果正在在线校准IMU-CAM时间偏移量，t_off_new可能会发生变化，导致time0不连续
+  // 所以本次传播的起点必须从上次实际结束的 IMU 时刻继续，否则会导致: 
+  //  - 区间重叠：如果用 t_off_new 代替，可能会重复或遗漏 IMU 数据
+  //  - 传播间隙：如果偏移值在校准中发生了变化，会导致 IMU 区间不连续
+  // 为什么 time1 用 t_off_new（当前偏移）？
+  // 因为当前帧的相机时间戳 timestamp 对应的 IMU 时间应该用当前最优估计的偏移量来计算。
+  // 随着标定的进行，calib_dt在缓慢更新，用最新的估计值更准确
+
+  // 总而言之：
+  // time0 用上次的偏移是因为要接上上次传播结束的位置，保证连续性；
+  // time1 用当前的偏移是因为要用最新估计来定位当前帧在 IMU 时间轴上的位置。
+  // 两者不同恰恰是时间偏移在线校准带来的必然结果。
+  double time0 = state->_timestamp + last_prop_time_offset; // 上次传播时间+上次的IMU-CAM时间偏移量
+  double time1 = timestamp + t_off_new; // 当前传播时间+当前的IMU-CAM时间偏移量
   std::vector<ov_core::ImuData> prop_data;
   {
     std::lock_guard<std::mutex> lck(imu_data_mtx);
+    // 从 IMU 缓冲区选取 [time0, time1] 区间内的所有测量值并自动处理边界处的插值
     prop_data = Propagator::select_imu_readings(imu_data, time0, time1);
   }
 
+  // 设计动机：将 N 次小步传播合并为一次大矩阵乘法，避免反复操作包含克隆状态的高维协方差矩阵P，大幅降低计算量。
+  /* 为什么这么设计？？？ 
+     1) 朴素方法：每算出一段F_i, Q_di，就立刻更新完整的系统协方差矩阵, 复杂度O(N^3)，其中N是状态维度（包含克隆状态）。
+      P = F_i * P * F_i.transpose() + Qd_i;  // 对大 P 做乘法
+      但完整的状态协方差的维度是 (imu_intrinsic_size + 15 + clone_size × 6)，可能有几百甚至几千维。
+      每次更新都要做O(N^3)的大矩阵乘法，非常昂贵。
+      2) 累积方法：先累积总的状态转移矩阵Phi_summed和噪声矩阵Qd_summed，最后只做一次大矩阵乘法。
+      关键洞察是：IMU 状态的传播只影响 IMU 块自身及其与克隆块的交叉协方差。
+
+      MSCKF 当前完整状态通常不只是 15 维 IMU 状态，还包括 X =[X_I, X_C1, X_C2, ..., X_CM, X_calib, X_slam]，总维度可能达到几百甚至上千维。
+      纯 IMU 传播期间，通常只有当前 IMU 状态在动态变化。历史克隆和标定状态本身不随 IMU 传播改变.
+      于是完整状态转移矩阵具有块结构 即
+      ​Φ_full = [ Φ_I     0
+                  0      I ]
+      其中 Φ_I 是 IMU 状态的传播矩阵，I 是克隆和标定状态的单位矩阵。这样就可以只对 IMU 块做传播，而不需要每次都对整个大矩阵做乘法。
+      把完整协方差写成 P = [ P_II  P_IR
+                          P_RI  P_RR ]
+      其中 II 是 IMU 块，RR 是剩余块(其余克隆、标定和地图状态)，IR/RI 是交叉协方差。
+      完整传播后
+      P'= Φ P Φ^T + Qd
+        = [ Φ_I     0 ] [ P_II  P_IR ] [ Φ_I^T   0 ] + [ Qd  0 ]
+          [  0      I ] [ P_RI  P_RR ] [ 0       I ]   [ 0     0 ]
+        = [ Φ_I*P_II*Φ_I^T + Qd   Φ_I*P_IR
+            P_RI*Φ_I^T            P_RR ]
+      所以IMU 状态的传播只影响 IMU 块自身及其与克隆块的交叉协方差。OpenVINS 的块状态和协方差索引系统就是为了高效处理这类动态状态块及交叉协方差
+      展开得到: 
+      P_II' = Φ_I*P_II*Φ_I^T + Qd
+      P_IR' = Φ_I*P_IR
+      P_RI' = P_RI*Φ_I^T
+      P_RR' = P_RR
+      所以只需对整个传播区间计算一次 𝛷 和 𝑄𝑑，然后：
+        - 一次大矩阵乘法更新 P_II 块
+        - 一次大矩阵乘法更新 P_IR 和 P_RI 交叉块
+        - 其余块 P_RR 完全不受影响
+      这样就只需要对 IMU 块做乘法，而剩余块保持不变，极大降低了计算量。
+   */
   // We are going to sum up all the state transition matrices, so we can do a single large multiplication at the end
   // Phi_summed = Phi_i*Phi_summed
   // Q_summed = Phi_i*Q_summed*Phi_i^T + Q_i
   // After summing we can multiple the total phi to get the updated covariance
   // We will then add the noise to the IMU portion of the state
+  // 这样设计是为了能够在最后面直接通过 EKFPropagation 一次性更新协方差矩阵
+  // Phi_summed 整个传播区间[time0, time1]的总状态转移矩阵
+  // Qd_summed 整个传播区间[time0, time1]累积的离散过程的噪声协方差矩阵
+  // 假如time0 是 k, time1是k+1，那么这个时候Phi_summed 就是从k到k+1的总状态转移矩阵Phi_k，Qd_summed就是从k到k+1的总噪声协方差矩阵Qd_k
   Eigen::MatrixXd Phi_summed = Eigen::MatrixXd::Identity(state->imu_intrinsic_size() + 15, state->imu_intrinsic_size() + 15);
   Eigen::MatrixXd Qd_summed = Eigen::MatrixXd::Zero(state->imu_intrinsic_size() + 15, state->imu_intrinsic_size() + 15);
   double dt_summed = 0;
@@ -101,6 +166,33 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
       // NOTE: Here we are summing the state transition F so we can do a single mutiplication later
       // NOTE: Phi_summed = Phi_i*Phi_summed
       // NOTE: Q_summed = Phi_i*Q_summed*Phi_i^T + G*Q_i*G^T
+      // 累加技术：不立即更新协方差，而是先累积总的 Phi_summed 和 Qd_summed，
+      // 最后只做一次大矩阵乘法更新协方差，避免反复对全部状态操作
+      /*
+        关于这一步公式的由来
+        由于IMU误差状态的连续时间模型为:
+          X_IMU(~)derivative = F * X_IMU(~) + G*n_IMU 
+          见MSCKF论文公式(10) https://www-users.cse.umn.edu/~stergios/papers/ICRA07-MSCKF.pdf
+        可以得到离散形式的 X(k+1) = Phi * X(k) + w, 其中 w ~ N(0, Qd)
+        其中 Phi = exp(F*dt) 是状态转移矩阵，Qd = ∫(Phi*G*Q*G^T*Phi^T)dt 是离散噪声协方差矩阵
+        如果我们有N段连续的IMU数据，每段的状态转移矩阵为 Phi_i，噪声协方差为 Qd_i，那么从初始时刻到最终时刻的总状态转移矩阵为:
+          Phi_total = Phi_N * Phi_(N-1) * ... * Phi_1
+        总噪声协方差为: Qd_total = Phi_N * ... * Phi_2 * Qd_1 * Phi_2^T * ... * Phi_N^T + ... + Qd_N
+
+        还可以用协方差递推公式的迭代更新来理解：
+        比如在传播过程中,我们以3个imu数据为例，按照协方差的传播公式 P'k+1|k = Phi_k * Pk|k * Phi_k^T + Qd_k
+        note: 如果一直只有IMU数据传播，没有任何观测更新，那么公式里的 Pk∣k就等于上一次传播（IMU积分）结束时的先验协方差 Pk∣k−1
+        1) 第一次传播: P1|0 = Phi_0 * P0|0 * Phi_0^T + Qd_0
+        2) 第二次传播: P2|1 = Phi_1 * P1|0 * Phi_1^ T + Qd_1
+                          = Phi_1 * (Phi_0 * P0|0 * Phi_0^T + Qd_0) * Phi_1^T + Qd_1
+                          = Phi_1 * Phi_0 * P0|0 * Phi_0^T * Phi_1^T + Phi_1 * Qd_0 * Phi_1^T + Qd_1
+        3) 第三次传播: P3|2 = Phi_2 * P2|1 * Phi_2^T + Qd_2
+                          = Phi_2 * (Phi_1 * (Phi_0 * P0|0 * Phi_0^T + Qd_0) * Phi_1^T + Qd_1) * Phi_2^T + Qd_2
+                          = Phi_2 * Phi_1 * Phi_0 * P0|0 * Phi_0^T * Phi_1^T * Phi_2^T + \ 
+                            Phi_2 * Phi_1 * Qd_0 * Phi_1^T * Phi_2^T + Phi_2 * Qd_1 * Phi_2^T + Qd_2
+        根据这三个公式去找相应的规律，就可以很明显的去设计Phi_summed 跟  Qd_summed了。
+
+      */
       Phi_summed = F * Phi_summed;
       Qd_summed = F * Qd_summed * F.transpose() + Qdi; // 把此前噪声传播到当前时刻，再加入当前段新噪声
       Qd_summed = 0.5 * (Qd_summed + Qd_summed.transpose()); // 强制保持对称
@@ -111,6 +203,7 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
 
   // Last angular velocity (used for cloning when estimating time offset)
   // Remember to correct them before we store them
+  // 存储传播结束时的校正角速度，供后续克隆（clone）时使用
   Eigen::Vector3d last_a = Eigen::Vector3d::Zero();
   Eigen::Vector3d last_w = Eigen::Vector3d::Zero();
   if (!prop_data.empty()) {
@@ -122,7 +215,7 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
   }
 
   // Do the update to the covariance with our "summed" state transition and IMU noise addition...
-  std::vector<std::shared_ptr<Type>> Phi_order;
+  std::vector<std::shared_ptr<Type>> Phi_order; // 参与传播的状态快
   Phi_order.push_back(state->_imu);
   if (state->_options.do_calib_imu_intrinsics) {
     Phi_order.push_back(state->_calib_imu_dw);
@@ -136,6 +229,7 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
       Phi_order.push_back(state->_calib_imu_ACCtoIMU);
     }
   }
+  // 一次性更新从time0到time1的协方差矩阵
   StateHelper::EKFPropagation(state, Phi_order, Phi_order, Phi_summed, Qd_summed);
 
   // Set timestamp data
@@ -424,8 +518,9 @@ std::vector<ov_core::ImuData> Propagator::select_imu_readings(const std::vector<
 }
 
 /**
- * @brief 预测状态并计算状态转移矩阵和过程噪声协方差
+ * @brief 预测名义状态并计算状态转移矩阵和过程噪声协方差
  * 三种传播方式: 1. RK4积分 2. 欧拉积分 3. 精确积分 (Analytical Integration)
+ * 这里滤波器的_timestamp理论上应该和data_plus.timestamp一致
  * @param state 滤波器的状态
  * @param data_minus 上一时刻的IMU测量数据
  * @param data_plus 当前时刻的IMU测量数据
@@ -476,7 +571,7 @@ void Propagator::predict_and_compute(std::shared_ptr<State> state, const ov_core
     compute_Xi_sum(state, dt, w_hat_avg, a_hat_avg, Xi_sum);
   }
 
-  // Compute the new state mean value，计算新的状态均值
+  // Compute the new state mean value，计算新的状态均值(名义状态)
   Eigen::Vector4d new_q;
   Eigen::Vector3d new_v, new_p;
   if (state->_options.integration_method == StateOptions::IntegrationMethod::ANALYTICAL) {
@@ -507,6 +602,8 @@ void Propagator::predict_and_compute(std::shared_ptr<State> state, const ov_core
   Qc.block(9, 9, 3, 3) = std::pow(_noises.sigma_ab, 2) / dt * Eigen::Matrix3d::Identity();
 
   // Compute the noise injected into the state over the interval
+  // 近似方法: Qd ≈ Gc * Qc * Gc^T * △t
+  // 精确方法: Qd = Gc * σ^2 I * Gc^T
   Qd = Eigen::MatrixXd::Zero(state->imu_intrinsic_size() + 15, state->imu_intrinsic_size() + 15);
   Qd = G * Qc * G.transpose();
   Qd = 0.5 * (Qd + Qd.transpose());
@@ -557,6 +654,19 @@ void Propagator::predict_mean_discrete(std::shared_ptr<State> state, double dt, 
   new_p = state->_imu->pos() + state->_imu->vel() * dt + 0.5 * R_Gtoi.transpose() * a_hat * dt * dt - 0.5 * _gravity * dt * dt;
 }
 
+/**
+ * @brief rk4四阶龙格-库塔积分法预测IMU状态的均值
+ * 
+ * @param state 滤波器状态
+ * @param dt 时间步长
+ * @param w_hat1 校正后的角速度（起始）
+ * @param a_hat1 校正后的加速度（起始）
+ * @param w_hat2 校正后的角速度（结束）
+ * @param a_hat2 校正后的加速度（结束）
+ * @param new_q 预测的四元数
+ * @param new_v 预测的速度
+ * @param new_p 预测的位置
+ */
 void Propagator::predict_mean_rk4(std::shared_ptr<State> state, double dt, const Eigen::Vector3d &w_hat1, const Eigen::Vector3d &a_hat1,
                                   const Eigen::Vector3d &w_hat2, const Eigen::Vector3d &a_hat2, Eigen::Vector4d &new_q,
                                   Eigen::Vector3d &new_v, Eigen::Vector3d &new_p) {
@@ -565,7 +675,7 @@ void Propagator::predict_mean_rk4(std::shared_ptr<State> state, double dt, const
   Eigen::Vector3d w_hat = w_hat1;
   Eigen::Vector3d a_hat = a_hat1;
   Eigen::Vector3d w_alpha = (w_hat2 - w_hat1) / dt;
-  Eigen::Vector3d a_jerk = (a_hat2 - a_hat1) / dt;
+  Eigen::Vector3d a_jerk = (a_hat2 - a_hat1) / dt; // 加加速度
 
   // y0 ================
   Eigen::Vector4d q_0 = state->_imu->quat();
@@ -662,10 +772,10 @@ void Propagator::compute_Xi_sum(std::shared_ptr<State> state, double dt, const E
 
   // Decompose our angular velocity into a direction and amount
   double w_norm = w_hat.norm(); // 旋转角速度的模长
-  double d_th = w_norm * dt; // 旋转角度增量
+  double d_th = w_norm * dt; // 旋转角度增量 w^ * δt
   Eigen::Vector3d k_hat = Eigen::Vector3d::Zero();
   if (w_norm > 1e-12) {
-    k_hat = w_hat / w_norm; // 旋转轴单位向量
+    k_hat = w_hat / w_norm; // 旋转轴单位向量，公式里的k^(= w^ / ||w^||)
   }
 
   // Compute useful identities used throughout
@@ -744,7 +854,7 @@ void Propagator::compute_Xi_sum(std::shared_ptr<State> state, double dt, const E
 
 /**
  * @brief 计算解析积分的状态均值预测
- * 
+ * https://docs.openvins.com/propagation_analytical.html#analytical_linearization
  * @param state 
  * @param dt 
  * @param w_hat 
@@ -774,12 +884,12 @@ void Propagator::predict_mean_analytic(std::shared_ptr<State> state, double dt, 
  * @brief 计算状态转移矩阵F和过程噪声输入矩阵G的解析表达式
  * 计算F和G的解析表达式见OpenVINS文档中的分析线性化部分
  * https://docs.openvins.com/propagation_analytical.html#analytical_linearization
- * @param state 
- * @param dt 
- * @param w_hat 
- * @param a_hat 
- * @param w_uncorrected 
- * @param a_uncorrected 
+ * @param state 滤波器状态
+ * @param dt    时间步长
+ * @param w_hat 校准后的角速度
+ * @param a_hat 校准后的加速度
+ * @param w_uncorrected 未校准的角速度
+ * @param a_uncorrected 未校准的加速度
  * @param new_q 
  * @param new_v 
  * @param new_p 
@@ -795,15 +905,15 @@ void Propagator::compute_F_and_G_analytic(std::shared_ptr<State> state, double d
 
   // Get the locations of each entry of the imu state
   int local_size = 0;
-  int th_id = local_size;
+  int th_id = local_size;   // 0 
   local_size += state->_imu->q()->size();
-  int p_id = local_size;
+  int p_id = local_size;    // 3
   local_size += state->_imu->p()->size();
-  int v_id = local_size;
+  int v_id = local_size;    // 6
   local_size += state->_imu->v()->size();
-  int bg_id = local_size;
+  int bg_id = local_size;   // 9 
   local_size += state->_imu->bg()->size();
-  int ba_id = local_size;
+  int ba_id = local_size;   // 12
   local_size += state->_imu->ba()->size();
 
   // If we are doing calibration, we can define their "local" id in the state transition
@@ -813,19 +923,19 @@ void Propagator::compute_F_and_G_analytic(std::shared_ptr<State> state, double d
   int th_atoI_id = -1;
   int th_wtoI_id = -1;
   if (state->_options.do_calib_imu_intrinsics) {
-    Dw_id = local_size;
+    Dw_id = local_size;   // 15
     local_size += state->_calib_imu_dw->size();
-    Da_id = local_size;
+    Da_id = local_size;   // 21
     local_size += state->_calib_imu_da->size();
     if (state->_options.do_calib_imu_g_sensitivity) {
-      Tg_id = local_size;
+      Tg_id = local_size; // 27
       local_size += state->_calib_imu_tg->size();
     }
     if (state->_options.imu_model == StateOptions::ImuModel::KALIBR) {
-      th_wtoI_id = local_size;
+      th_wtoI_id = local_size; // 36
       local_size += state->_calib_imu_GYROtoIMU->size();
     } else {
-      th_atoI_id = local_size;
+      th_atoI_id = local_size; // 36
       local_size += state->_calib_imu_ACCtoIMU->size();
     }
   }
