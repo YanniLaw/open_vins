@@ -44,6 +44,7 @@ public:
     _p = std::shared_ptr<Vec>(new Vec(3));
 
     // Set our default state value
+    // 7*1 vector containing [quat (x,y,z,w), pos (x,y,z)]
     Eigen::Matrix<double, 7, 1> pose0;
     pose0.setZero();
     pose0(3) = 1.0; // w 分量为1，表示初始旋转为单位旋转
@@ -55,7 +56,7 @@ public:
 
   /**
    * @brief Sets id used to track location of variable in the filter covariance
-   *
+   * 设置在滤波器协方差矩阵中跟踪变量位置的ID
    * Note that we update the sub-variables also.
    *
    * @param new_id entry in filter covariance corresponding to this variable

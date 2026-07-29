@@ -72,6 +72,10 @@ void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector
   }
 
   // Assert that we have correct sizes
+  // Φ 矩阵本身就是稠密连续矩阵，不是块对角稀疏矩阵。它的列按照 order_OLD 的顺序排列，行按照 order_NEW 的顺序排列。
+  // 比如 order = [imu(15维), calib_dw(6维), calib_da(6维)]，那么 Φ 就是一个 27 x 27 的稠密矩阵，
+  // 前 15 行对应 imu，接下来的 6 行对应 calib_dw，最后 6 行对应 calib_da；
+  // 前 15 列对应 imu，接下来的 6 列对应 calib_dw，最后 6 列对应 calib_da。
   assert(size_order_NEW == Phi.rows());
   assert(size_order_OLD == Phi.cols());
   assert(size_order_NEW == Q.cols());
@@ -323,9 +327,26 @@ Eigen::MatrixXd StateHelper::get_full_covariance(std::shared_ptr<State> state) {
   return full_cov;
 }
 
+/**
+ * @brief 边缘化指定的状态变量
+ * 从协方差矩阵和状态变量列表中删除指定变量对应的行和列，并正确更新其他变量的 id 索引
+ * 假设状态向量分为三部分: x1（被删变量之前的）、xm（要删的）、x2（被删变量之后的）
+ * 协方差矩阵 P 的形式为：P = [ P11  P1m  P12 ]
+ *                         [ Pm1  Pmm  Pm2 ]
+ *                         [ P21  P2m  P22 ]
+ * 边缘化 xm 后，新的协方差矩阵 P_new 为：
+ * P’ = [ P11  P12 ]
+ *         [ P21  P22 ]
+ * 其中 P11、P12、P21、P22 分别对应 x1 和 x2 的协方差块，P1m、Pm1、Pm2、P2m 被删除。
+ * 这里没有做 Schur complement 之类的操作——OpenVINS 的 MSCKF 实现中，边缘化克隆就是直接把该克隆的行列删掉。
+ * 这不损失信息，因为后续不再需要这些克隆来约束其他状态。
+ * @param state 当前滤波器状态
+ * @param marg 要边缘化的状态变量 _clones_IMU 中保存的 imu pose变量
+ */
 void StateHelper::marginalize(std::shared_ptr<State> state, std::shared_ptr<Type> marg) {
 
   // Check if the current state has the element we want to marginalize
+  // 首先检查是否在滤波器的状态向量列表中找到要边缘化的变量
   if (std::find(state->_variables.begin(), state->_variables.end(), marg) == state->_variables.end()) {
     PRINT_ERROR(RED "StateHelper::marginalize() - Called on variable that is not in the state\n" RESET);
     PRINT_ERROR(RED "StateHelper::marginalize() - Marginalization, does NOT work on sub-variables yet...\n" RESET);
@@ -345,12 +366,12 @@ void StateHelper::marginalize(std::shared_ptr<State> state, std::shared_ptr<Type
   //
   // i.e. x_1 goes from 0 to marg_id, x_2 goes from marg_id+marg_size to Cov.rows() in the original covariance
 
-  int marg_size = marg->size();
-  int marg_id = marg->id();
-  int x2_size = (int)state->_Cov.rows() - marg_id - marg_size;
-
+  int marg_size = marg->size(); // 被删状态变量的维度
+  int marg_id = marg->id();     // 被删状态变量在协方差中的起始位置
+  int x2_size = (int)state->_Cov.rows() - marg_id - marg_size; // 被删变量之后 变量x2(严格来说是剩余变量)的维度
+  // 边缘化之后的协方差矩阵维度为 原来的rows - marg_size
   Eigen::MatrixXd Cov_new(state->_Cov.rows() - marg_size, state->_Cov.rows() - marg_size);
-
+  // 更新新的协方差矩阵的各个块
   // P_(x_1,x_1)
   Cov_new.block(0, 0, marg_id, marg_id) = state->_Cov.block(0, 0, marg_id, marg_id);
 
@@ -377,6 +398,7 @@ void StateHelper::marginalize(std::shared_ptr<State> state, std::shared_ptr<Type
     if (state->_variables.at(i) != marg) {
       if (state->_variables.at(i)->id() > marg_id) {
         // If the variable is "beyond" the marginal one in ordering, need to "move it forward"
+        // 边缘化过后，处于被删变量之后的所有变量的 id(在协方差矩阵中的位置) 都需要向前移动 marg_size
         state->_variables.at(i)->set_local_id(state->_variables.at(i)->id() - marg_size);
       }
       remaining_variables.push_back(state->_variables.at(i));
@@ -387,31 +409,49 @@ void StateHelper::marginalize(std::shared_ptr<State> state, std::shared_ptr<Type
   // NOTE: we don't need to do this any more since our variable is a shared ptr
   // NOTE: thus this is automatically managed, but this allows outside references to keep the old variable
   // delete marg;
+  // 将被删变量的 id 设为 -1，表示它已不在状态向量中，防止后续误用
   marg->set_local_id(-1);
 
   // Now set variables as the remaining ones
   state->_variables = remaining_variables;
 }
 
+/**
+ * @brief 这个函数接收一个现有状态变量（如 IMU 位姿），完整复制一份追加到状态向量末尾，并正确填充新变量与所有其他变量的协方差
+ * 
+ * @param state 误差卡尔曼滤波状态
+ * @param variable_to_clone 要克隆的状态变量(单一变量或子变量)
+ * @return std::shared_ptr<Type> 
+ */
 std::shared_ptr<Type> StateHelper::clone(std::shared_ptr<State> state, std::shared_ptr<Type> variable_to_clone) {
 
   // Get total size of new cloned variables, and the old covariance size
-  int total_size = variable_to_clone->size();
-  int old_size = (int)state->_Cov.rows();
-  int new_loc = (int)state->_Cov.rows();
+  int total_size = variable_to_clone->size(); // 要克隆的状态变量的维度
+  int old_size = (int)state->_Cov.rows(); // 克隆前的全局状态协方差矩阵的维度
+  int new_loc = (int)state->_Cov.rows();  // 克隆后新变量在全局状态向量中的起始位置（即原协方差矩阵的末尾）
 
-  // Resize both our covariance to the new size
+  // Resize both our covariance to the new size,扩充协方差矩阵
+  // 协方差从 old_size × old_size 扩展为 (old_size+total_size) × (old_size+total_size)，新区域全部填充 0
+  // conservativeResizeLike 的核心功能是将当前矩阵或数组的大小，调整为与另一个矩阵或数组（other）完全相同
+  // 函数名中的“保守”（Conservative）是其行为的关键，主要体现在数据保留上: 
+  // 1. 保留左上角数据：调整大小时，原矩阵/数组中位于“左上角”的数据会被尽可能地保留下来
+  // 2. 扩大 (New Size > Old Size)：原有数据保留在左上角，但新增加的行和列的元素是未初始化的，其值是未定义的（“垃圾值”）!!!!
+  // 3. 缩小 (New Size < Old Size)：矩阵/数组会被截断，只保留左上角的部分数据，超出新尺寸范围的数据将丢失
   state->_Cov.conservativeResizeLike(Eigen::MatrixXd::Zero(old_size + total_size, old_size + total_size));
 
   // What is the new state, and variable we inserted
-  const std::vector<std::shared_ptr<Type>> new_variables = state->_variables;
+  const std::vector<std::shared_ptr<Type>> new_variables = state->_variables; // not used
   std::shared_ptr<Type> new_clone = nullptr;
 
   // Loop through all variables, and find the variable that we are going to clone
+  // 在状态变量列表中定位当前被克隆变量
   for (size_t k = 0; k < state->_variables.size(); k++) {
 
     // Skip this if it is not the same
     // First check if the top level variable is the same, then check the sub-variables
+    // 从当前滤波器状态中查找匹配的克隆状态变量（支持子变量查找）
+    // check_if_subvariable 会返回一个指向匹配子变量的 shared_ptr，如果没有匹配则返回 nullptr
+    // 这一句没有起到什么作用啊
     std::shared_ptr<Type> type_check = state->_variables.at(k)->check_if_subvariable(variable_to_clone);
     if (state->_variables.at(k) == variable_to_clone) {
       type_check = state->_variables.at(k);
@@ -419,17 +459,18 @@ std::shared_ptr<Type> StateHelper::clone(std::shared_ptr<State> state, std::shar
       continue;
     }
 
-    // So we will clone this one
+    // So we will clone this one // 被克隆变量在协方差中的位置
     int old_loc = type_check->id();
 
     // Copy the covariance elements
+    // 复制三个块: 自有协方差块、新克隆变量与其他变量的交叉协方差块(行和列)
     state->_Cov.block(new_loc, new_loc, total_size, total_size) = state->_Cov.block(old_loc, old_loc, total_size, total_size);
     state->_Cov.block(0, new_loc, old_size, total_size) = state->_Cov.block(0, old_loc, old_size, total_size);
     state->_Cov.block(new_loc, 0, total_size, old_size) = state->_Cov.block(old_loc, 0, total_size, old_size);
 
     // Create clone from the type being cloned
-    new_clone = type_check->clone();
-    new_clone->set_local_id(new_loc);
+    new_clone = type_check->clone();  // 深拷贝
+    new_clone->set_local_id(new_loc); // 设置新克隆变量在协方差矩阵中的起始位置
     break;
   }
 
@@ -635,12 +676,14 @@ void StateHelper::initialize_invertible(std::shared_ptr<State> state, std::share
  * @brief 状态克隆（clone）是指在滤波器中添加一个新的状态变量，该变量的初始值和协方差与现有状态变量相同。
  * 这个函数实现了状态克隆的过程，并且在时间校准的情况下，还会根据IMU的角速度和线速度来调整协方差矩阵，以反映时间偏移对状态估计的不确定性影响。
  * 
- * @param state 
- * @param last_w 
+ * @param state 误差滤波器状态
+ * @param last_w IMU角速度
  */
 void StateHelper::augment_clone(std::shared_ptr<State> state, Eigen::Matrix<double, 3, 1> last_w) {
 
   // We can't insert a clone that occured at the same timestamp!
+  // state->_timestamp 表明当前滤波器已经传播到了这个时间点，
+  // 如果在这个时间点已经有一个克隆存在，那么就会导致状态冲突，因此需要检查是否已经存在该克隆。
   if (state->_clones_IMU.find(state->_timestamp) != state->_clones_IMU.end()) {
     PRINT_ERROR(RED "TRIED TO INSERT A CLONE AT THE SAME TIME AS AN EXISTING CLONE, EXITING!#!@#!@#\n" RESET);
     std::exit(EXIT_FAILURE);
@@ -648,6 +691,7 @@ void StateHelper::augment_clone(std::shared_ptr<State> state, Eigen::Matrix<doub
 
   // Call on our cloner and add it to our vector of types
   // NOTE: this will clone the clone pose to the END of the covariance...
+  // 克隆imu位姿: 并将其添加到状态变量列表中，同时扩展协方差矩阵以包含新克隆的状态变量。
   std::shared_ptr<Type> posetemp = StateHelper::clone(state, state->_imu->pose());
 
   // Cast to a JPL pose type, check if valid
@@ -657,7 +701,7 @@ void StateHelper::augment_clone(std::shared_ptr<State> state, Eigen::Matrix<doub
     std::exit(EXIT_FAILURE);
   }
 
-  // Append the new clone to our clone vector
+  // Append the new clone to our clone vector， 克隆IMU位姿，即在滤波器状态中添加新的克隆IMU状态
   state->_clones_IMU[state->_timestamp] = pose;
 
   // If we are doing time calibration, then our clones are a function of the time offset
@@ -677,15 +721,22 @@ void StateHelper::augment_clone(std::shared_ptr<State> state, Eigen::Matrix<doub
   }
 }
 
+/**
+ * @brief 边缘化最旧的克隆IMU状态
+ * 该函数一般每次 EKF 更新后被调用
+ * @param state 当前滤波器状态
+ */
 void StateHelper::marginalize_old_clone(std::shared_ptr<State> state) {
   if ((int)state->_clones_IMU.size() > state->_options.max_clone_size) {
     double marginal_time = state->margtimestep();
     // Lock the mutex to avoid deleting any elements from _clones_IMU while accessing it from other threads
+    // 这个可能会在特征跟踪等线程中被加锁
     std::lock_guard<std::mutex> lock(state->_mutex_state);
     assert(marginal_time != INFINITY);
     StateHelper::marginalize(state, state->_clones_IMU.at(marginal_time));
     // Note that the marginalizer should have already deleted the clone
     // Thus we just need to remove the pointer to it from our state
+    // 从误差滤波器状态中的克隆map中删除最旧的克隆IMU状态
     state->_clones_IMU.erase(marginal_time);
   }
 }

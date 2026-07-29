@@ -124,11 +124,13 @@ public:
     assert(dx.rows() == _size);
 
     // Build perturbing quaternion，论文formula 68 69 70
+    // δq = [0.5*δθ, 1]^T
     Eigen::Matrix<double, 4, 1> dq;
     dq << .5 * dx, 1.0; // 构造扰动四元数，左乘误差状态定义中，误差状态是轴角的一半，所以这里乘以0.5
     dq = ov_core::quatnorm(dq);
 
     // Update estimate and recompute R
+    // q_new = δq ⊗ q_old
     set_value(ov_core::quat_multiply(dq, _value));
   }
 

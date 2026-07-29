@@ -122,7 +122,7 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
       完整传播后
       P'= Φ P Φ^T + Qd
         = [ Φ_I     0 ] [ P_II  P_IR ] [ Φ_I^T   0 ] + [ Qd  0 ]
-          [  0      I ] [ P_RI  P_RR ] [ 0       I ]   [ 0     0 ]
+          [  0      I ] [ P_RI  P_RR ] [ 0       I ]   [ 0   0 ]
         = [ Φ_I*P_II*Φ_I^T + Qd   Φ_I*P_IR
             P_RI*Φ_I^T            P_RR ]
       所以IMU 状态的传播只影响 IMU 块自身及其与克隆块的交叉协方差。OpenVINS 的块状态和协方差索引系统就是为了高效处理这类动态状态块及交叉协方差
@@ -146,6 +146,7 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
   // Phi_summed 整个传播区间[time0, time1]的总状态转移矩阵
   // Qd_summed 整个传播区间[time0, time1]累积的离散过程的噪声协方差矩阵
   // 假如time0 是 k, time1是k+1，那么这个时候Phi_summed 就是从k到k+1的总状态转移矩阵Phi_k，Qd_summed就是从k到k+1的总噪声协方差矩阵Qd_k
+  // 这里矩阵的维度是自适应适配的，会根据参数的配置来决定是否包含IMU内参、重力敏感性等误差状态变量
   Eigen::MatrixXd Phi_summed = Eigen::MatrixXd::Identity(state->imu_intrinsic_size() + 15, state->imu_intrinsic_size() + 15);
   Eigen::MatrixXd Qd_summed = Eigen::MatrixXd::Zero(state->imu_intrinsic_size() + 15, state->imu_intrinsic_size() + 15);
   double dt_summed = 0;
@@ -236,7 +237,7 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
   state->_timestamp = timestamp;
   last_prop_time_offset = t_off_new;
 
-  // Now perform stochastic cloning
+  // Now perform stochastic cloning 状态增广以及协方差扩增
   StateHelper::augment_clone(state, last_w);
 }
 

@@ -332,6 +332,11 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   do_feature_propagate_update(message);
 }
 
+/**
+ * @brief 核心处理函数，负责完成状态传播 → MSCKF 更新 → SLAM 更新 → 边缘化 的完整 EKF 迭代
+ * 
+ * @param message 当前帧相机测量数据，包含时间戳、相机ID、图像数据和掩码（如果使用
+ */
 void VioManager::do_feature_propagate_update(const ov_core::CameraData &message) {
 
   //===================================================================================
@@ -339,6 +344,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   //===================================================================================
 
   // Return if the camera measurement is out of order
+  // 如果相机帧的时间戳早于当前状态时间，说明乱序到达，直接返回
   if (state->_timestamp > message.timestamp) {
     PRINT_WARNING(YELLOW "image received out of order, unable to do anything (prop dt = %3f)\n" RESET,
                   (message.timestamp - state->_timestamp));
@@ -349,6 +355,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // Also augment it with a new clone!
   // NOTE: if the state is already at the given time (can happen in sim)
   // NOTE: then no need to prop since we already are at the desired timestep
+  // 用 IMU数据将状态传播到当前相机时间，同时新增一个克隆 (clone) 保存该时刻的位姿，用于后续特征三角化
   if (state->_timestamp != message.timestamp) {
     propagator->propagate_and_clone(state, message.timestamp);
   }
@@ -357,6 +364,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // If we have not reached max clones, we should just return...
   // This isn't super ideal, but it keeps the logic after this easier...
   // We can start processing things when we have at least 5 clones since we can start triangulating things...
+  // 三角化特征至少需要 2 个视角，这里要求至少有 min(5, max_clone_size) 个克隆后才开始更新。这是为了保证有足够的基线进行可靠三角化
   if ((int)state->_clones_IMU.size() < std::min(state->_options.max_clone_size, 5)) {
     PRINT_DEBUG("waiting for enough clone states (%d of %d)....\n", (int)state->_clones_IMU.size(),
                 std::min(state->_options.max_clone_size, 5));
@@ -364,11 +372,13 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   }
 
   // Return if we where unable to propagate
+  // 这一句是检测 propagate_and_clone() 是否成功传播到当前相机时间，如果失败则直接返回
   if (state->_timestamp != message.timestamp) {
     PRINT_WARNING(RED "[PROP]: Propagator unable to propagate the state forward in time!\n" RESET);
     PRINT_WARNING(RED "[PROP]: It has been %.3f since last time we propagated\n" RESET, message.timestamp - state->_timestamp);
     return;
   }
+  // 程序运行到了这里，说明前面的零速更新检查到了系统已经发生了移动，因此可以执行正常的 VIO 传播以及更新了
   has_moved_since_zupt = true;
 
   //===================================================================================

@@ -33,7 +33,7 @@ State::State(StateOptions &options) {
   // Append the imu to the state and covariance
   int current_id = 0; // 当前状态变量在协方差矩阵中的起始索引位置
   _imu = std::make_shared<IMU>();
-  _imu->set_local_id(current_id);
+  _imu->set_local_id(current_id); // 0
   _variables.push_back(_imu);
   current_id += _imu->size();
 
@@ -85,18 +85,18 @@ State::State(StateOptions &options) {
   if (options.do_calib_imu_intrinsics) {
 
     // Gyroscope dw
-    _calib_imu_dw->set_local_id(current_id);
+    _calib_imu_dw->set_local_id(current_id);  // 15
     _variables.push_back(_calib_imu_dw);
     current_id += _calib_imu_dw->size();
 
     // Accelerometer da
-    _calib_imu_da->set_local_id(current_id);
+    _calib_imu_da->set_local_id(current_id);  // 21
     _variables.push_back(_calib_imu_da);
     current_id += _calib_imu_da->size();
 
     // Gyroscope gravity sensitivity
     if (options.do_calib_imu_g_sensitivity) {
-      _calib_imu_tg->set_local_id(current_id);
+      _calib_imu_tg->set_local_id(current_id);  // 27
       _variables.push_back(_calib_imu_tg);
       current_id += _calib_imu_tg->size();
     }
@@ -104,11 +104,11 @@ State::State(StateOptions &options) {
     // If kalibr model, R_GYROtoIMU is calibrated
     // If rpng model, R_ACCtoIMU is calibrated
     if (options.imu_model == StateOptions::ImuModel::KALIBR) {
-      _calib_imu_GYROtoIMU->set_local_id(current_id);
+      _calib_imu_GYROtoIMU->set_local_id(current_id); // 36
       _variables.push_back(_calib_imu_GYROtoIMU);
       current_id += _calib_imu_GYROtoIMU->size();
     } else {
-      _calib_imu_ACCtoIMU->set_local_id(current_id);
+      _calib_imu_ACCtoIMU->set_local_id(current_id);  // 36
       _variables.push_back(_calib_imu_ACCtoIMU);
       current_id += _calib_imu_ACCtoIMU->size();
     }
@@ -117,7 +117,7 @@ State::State(StateOptions &options) {
   // Camera to IMU time offset 标定相机和IMU之间的时间偏移
   _calib_dt_CAMtoIMU = std::make_shared<Vec>(1);
   if (_options.do_calib_camera_timeoffset) {
-    _calib_dt_CAMtoIMU->set_local_id(current_id);
+    _calib_dt_CAMtoIMU->set_local_id(current_id); // 39
     _variables.push_back(_calib_dt_CAMtoIMU);
     current_id += _calib_dt_CAMtoIMU->size();
   }
@@ -137,24 +137,27 @@ State::State(StateOptions &options) {
 
     // If calibrating camera-imu pose, add to variables
     if (_options.do_calib_camera_pose) {
-      pose->set_local_id(current_id);
+      pose->set_local_id(current_id); // 40 / 54 / 68
       _variables.push_back(pose);
       current_id += pose->size();
     }
 
     // If calibrating camera intrinsics, add to variables
     if (_options.do_calib_camera_intrinsics) {
-      intrin->set_local_id(current_id);
+      intrin->set_local_id(current_id); // 46 / 60 / 74
       _variables.push_back(intrin);
       current_id += intrin->size();
     }
   }
 
   // Finally initialize our covariance to small value 给一个小正值可以保证初始协方差正定，EKF更稳
+  // 协方差的大小取决于状态变量的单位和量纲，通常是根据实际参数设置情况进行调整的
   _Cov = std::pow(1e-3, 2) * Eigen::MatrixXd::Identity(current_id, current_id);
 
-  // Finally, set some of our priors for our calibration parameters 给出先验
+  // Finally, set some of our priors for our calibration parameters
+  // 如果要标定的话，需要设置一些协方差的先验
   if (_options.do_calib_imu_intrinsics) {
+    // 后面可以用_calib_imu_dw->size()这样来代替矩阵
     _Cov.block(_calib_imu_dw->id(), _calib_imu_dw->id(), 6, 6) = std::pow(0.005, 2) * Eigen::Matrix<double, 6, 6>::Identity();
     _Cov.block(_calib_imu_da->id(), _calib_imu_da->id(), 6, 6) = std::pow(0.008, 2) * Eigen::Matrix<double, 6, 6>::Identity();
     if (_options.do_calib_imu_g_sensitivity) {

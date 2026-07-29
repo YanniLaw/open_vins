@@ -95,9 +95,10 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
     return false;
   }
 
-  // If the thread was a success, then return success! 初始化成功了也直接返回成功，避免第二次初始化
+  // If the thread was a success, then return success! 
+  // 在上一次线程中初始化成功了， 这里直接返回成功，避免第二次初始化
   if (thread_init_success) {
-    return true;
+    return true; // 返回初始化成功的地方!!!
   }
 
   // Run the initialization in a second thread so it can go as slow as it desires
@@ -204,7 +205,7 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
         StateHelper::marginalize_old_clone(state); // 如果 clone 超过上限，立即边缘化最老的，保持滑窗大小受控
       }
       PRINT_DEBUG(YELLOW "[init]: moved the state forward %.2f seconds\n" RESET, state->_timestamp - timestamp);
-      thread_init_success = true;
+      thread_init_success = true; // 设置初始化成功标志，但是是在下一次调用try_to_initialize再直接返回true
       camera_queue_init.clear();
 
     } else {

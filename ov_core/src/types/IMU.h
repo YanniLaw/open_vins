@@ -46,8 +46,10 @@ public:
     _ba = std::shared_ptr<Vec>(new Vec(3));
 
     // Set our default state value
+    // 16个元素，分别是四元数(4) + 位置(3) + 速度(3) + 陀螺仪偏置(3) + 加速度计偏置(3)
+    // quat = [0 0 0 1]^T, pos = [0 0 0]^T, vel = [0 0 0]^T, bg = [0 0 0]^T, ba = [0 0 0]^T
     Eigen::VectorXd imu0 = Eigen::VectorXd::Zero(16, 1);
-    imu0(3) = 1.0;
+    imu0(3) = 1.0; // 四元数的实部为1，表示单位四元数
     set_value_internal(imu0);
     set_fej_internal(imu0);
   }
@@ -85,12 +87,12 @@ public:
     dq << .5 * dx.block(0, 0, 3, 1), 1.0;
     dq = ov_core::quatnorm(dq);
 
-    newX.block(0, 0, 4, 1) = ov_core::quat_multiply(dq, quat());
-    newX.block(4, 0, 3, 1) += dx.block(3, 0, 3, 1);
+    newX.block(0, 0, 4, 1) = ov_core::quat_multiply(dq, quat()); // q
+    newX.block(4, 0, 3, 1) += dx.block(3, 0, 3, 1);     // p
 
-    newX.block(7, 0, 3, 1) += dx.block(6, 0, 3, 1);
-    newX.block(10, 0, 3, 1) += dx.block(9, 0, 3, 1);
-    newX.block(13, 0, 3, 1) += dx.block(12, 0, 3, 1);
+    newX.block(7, 0, 3, 1) += dx.block(6, 0, 3, 1);     // v
+    newX.block(10, 0, 3, 1) += dx.block(9, 0, 3, 1);    // bg
+    newX.block(13, 0, 3, 1) += dx.block(12, 0, 3, 1);   // ba
 
     set_value(newX);
   }

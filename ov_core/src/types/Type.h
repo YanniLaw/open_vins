@@ -48,7 +48,8 @@ public:
 
   /**
    * @brief Sets id used to track location of variable in the filter covariance
-   *
+   * 设置状态变量在协方差矩阵中的位置索引。该索引用于在滤波器的协方差矩阵中定位该变量的误差状态。
+   * 通过设置这个ID，滤波器可以正确地更新和管理状态变量的协方差信息。
    * Note that the minimum ID is -1 which says that the state is not in our covariance.
    * If the ID is larger than -1 then this is the index location in the covariance matrix.
    *
@@ -58,11 +59,13 @@ public:
 
   /**
    * @brief Access to variable id (i.e. its location in the covariance)
+   * 这里表示的是状态变量在协方差矩阵中的起始索引位置
    */
   int id() { return _id; }
 
   /**
    * @brief Access to variable size (i.e. its error state size)
+   * 这里表示的是误差状态的维度，而不是状态变量本身的维度。
    */
   int size() { return _size; }
 

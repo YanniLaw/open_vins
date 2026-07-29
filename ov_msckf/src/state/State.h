@@ -119,18 +119,18 @@ public:
 
   /**
    * @brief Calculates the error state size for imu intrinsics.
-   *
+   * 自适应的返回IMU内参的误差状态维度大小
    * This is used to construct our state transition which depends on if we are estimating calibration.
    * 15 if doing intrinsics, another +9 if doing grav sensitivity
    *
    * @return size of error state
    */
   int imu_intrinsic_size() const {
-    int sz = 0;
+    int sz = 0; // 不开标定时返回0
     if (_options.do_calib_imu_intrinsics) {
-      sz += 15;
+      sz += 15; // Dw(6) + Da(6) + δR_ACCtoIMU(3) or δR_GYROtoIMU(3)
       if (_options.do_calib_imu_g_sensitivity) {
-        sz += 9;
+        sz += 9; // Tg(9)
       }
     }
     return sz;

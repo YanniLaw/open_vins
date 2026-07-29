@@ -95,6 +95,9 @@ public:
    */
   void initialize_with_gt(Eigen::Matrix<double, 17, 1> imustate);
 
+  /// Request that the estimator state be reset at the next camera measurement
+  void request_reset() { reset_requested.store(true, std::memory_order_relaxed); }
+
   /// If we are initialized or not
   bool initialized() { return is_initialized_vio && timelastupdate != -1; }
 
@@ -224,6 +227,7 @@ protected:
 
   // Threads and their atomics
   std::atomic<bool> thread_init_running, thread_init_success;
+  std::atomic<bool> reset_requested{false};
 
   // If we did a zero velocity update
   bool did_zupt_update = false;

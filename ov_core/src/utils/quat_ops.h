@@ -501,7 +501,7 @@ inline Eigen::Matrix<double, 4, 4> Omega(Eigen::Matrix<double, 3, 1> w) {
 }
 
 /**
- * @brief Normalizes a quaternion to make sure it is unit norm
+ * @brief Normalizes a quaternion to make sure it is unit norm 四元数归一化，确保其单位范数
  * @param q_t Quaternion to normalized
  * @return Normalized quaterion
  */
