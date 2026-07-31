@@ -96,13 +96,14 @@ void TrackKLT::feed_new_camera(const CameraData &message) {
 
 /**
  * @brief Feeds a monocular image to the KLT tracker, performing feature detection and tracking.
- * 
+ * 上一帧特征 → 补充检测(topo-off) → KLT跟踪 → RANSAC去外点 → 更新数据库 → 推进到下一帧
  * @param message The camera data containing images and masks.
  * @param msg_id The index of the image within the message to process.
  */
 void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
 
   // Lock this data feed for this camera
+  // 每个相机有独立的 mtx_feeds 锁，防止多线程同时访问同一个相机的数据
   size_t cam_id = message.sensor_ids.at(msg_id);
   std::lock_guard<std::mutex> lck(mtx_feeds.at(cam_id));
 
@@ -133,23 +134,35 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   // This will "top-off" our number of tracks so always have a constant number
   // 在上一帧补充特征，以确保有足够的点进行 KLT 跟踪
   int pts_before_detect = (int)pts_last[cam_id].size();
-  std::vector<cv::KeyPoint> pts_left_match;
+  std::vector<cv::KeyPoint> pts_left_match; // 这里是亚像素坐标!!!!
   std::vector<size_t> ids_left_match;
   pts_left_match.reserve(num_features);
   ids_left_match.reserve(num_features);
   pts_left_match = pts_last[cam_id];
   ids_left_match = ids_last[cam_id];
+
+  // ************ 非常重要 ****************** // 
+  // Top-off 特征补充： 先在上一帧补点，然后把这些点一起通过 KLT 跟踪到当前帧
   // 检测是在上一帧图像上做的，而不是当前帧。目的是在跟踪之前先把上一帧的特征数量补满，确保 KLT 输入有足够的点。
   // 这样即使上一帧跟丢了很多点，也能及时补充新的，保持稳定的跟踪数量。
+  // 优点: 1. 新点进入数据库时，通常已经拥有至少两帧观测; 2. 当前帧接收到的点都是经过一次光流验证的; 3. 不会立即把当前帧刚检测、但尚未验证的点当成长轨迹
+  // 缺点: 1. 在上一帧新补的点可能只存在很短时间,如果两帧间运动较大，刚补的点可能马上丢失; 
+  //      2. 会额外对新补点执行一次光流.
+  // 与VINS Fusion补点区别: 
+  // VINS Fusion是先把旧点跟踪到当前帧,然后在当前帧补点,再把新点加入到跟踪列表中，下一帧才真正经过 LK 光流验证。
+  // 优点: 
+  // 1. 逻辑更直观 2. 新点直接根据当前图像质量检测 3. 不需要把刚检测出的点立即再做一次光流
+  // 4. 当前帧总点数容易维持在 MAX_CNT 附近
+  // 缺点: 1. 新点只有当前帧的观测,是否稳定要等下一帧才能确认 2. 在曝光突变或运动模糊帧中，可能补入一批短命点
   perform_detection_monocular(img_pyramid_last[cam_id], img_mask_last[cam_id], pts_left_match, ids_left_match);
   rT3 = boost::posix_time::microsec_clock::local_time();
 
   // Our return success masks, and predicted new features
-  std::vector<uchar> mask_ll;
+  std::vector<uchar> mask_ll; // 跟踪成功标志
   std::vector<cv::KeyPoint> pts_left_new = pts_left_match; // 初始猜测
 
   // Lets track temporally
-  // KLT 跟踪，返回的是畸变像素坐标。且pts_left_match 和 pts_left_new 会被原地更新。
+  // KLT 光流跟踪，返回的是畸变像素坐标。且 pts_left_match 和 pts_left_new 会被原地更新。
   perform_matching(img_pyramid_last[cam_id], imgpyr, pts_left_match, pts_left_new, cam_id, cam_id, mask_ll);
   assert(pts_left_new.size() == ids_left_match.size());
   rT4 = boost::posix_time::microsec_clock::local_time();
@@ -409,11 +422,17 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
 
 /**
  * @brief Performs feature detection on a monocular image using the KLT tracker.
- * 在单目图像中保持恒定数量的特征点跟踪，并确保新检测的特征均匀分布在图像中。
- * @param img0pyr The image pyramid of the current frame.
- * @param mask0 The mask indicating valid regions for feature detection.
- * @param pts0 The vector of keypoints to be updated with detected features.
- * @param ids0 The vector of feature IDs corresponding to the detected keypoints.
+ * 在给定的图像上补充检测新特征点，使跟踪点总数维持在 num_features 附近，并确保特征在图像中空间分布均匀。
+ * 关键设计要点总结: 
+ * 1. 双层网格: 精细网格保证最小间距，粗网格保证空间均匀分布;
+ * 2. 膨胀掩膜: 在已有特征周围画矩形，避免新检测点在旧点附近重复;
+ * 3. 按需检测: 只对特征不足的网格提取 FAST，避免全图扫描;
+ * 4. Top-off 时机: 在上一帧上补点，而非当前帧——这样新补的点在下一帧就会经过一次 KLT 验证，进入数据库时已有两帧观测;
+ * 5. 二次近邻过滤: Grider_GRID 只做粗网格均匀化，离旧特征太近的点需要 grid_2d_close 再做一次精确过滤
+ * @param img0pyr The image pyramid of the current frame.一般是上一帧图像的金字塔，用于在上一帧补充特征点(只有第一帧是当前帧)
+ * @param mask0 The mask indicating valid regions for feature detection.上一帧图像的mask(只有第一帧是当前帧)
+ * @param pts0 The vector of keypoints to be updated with detected features. [in/out] 已有特征 + 新检测的特征
+ * @param ids0 The vector of feature IDs corresponding to the detected keypoints.[in/out] 对应的特征 ID
  */
 void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, const cv::Mat &mask0, std::vector<cv::KeyPoint> &pts0,
                                            std::vector<size_t> &ids0) {
@@ -421,21 +440,27 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
   // Create a 2D occupancy grid for this current image
   // Note that we scale this down, so that each grid point is equal to a set of pixels
   // This means that we will reject points that less than grid_px_size points away then existing features
-  // 像素级网格（缩放因子 = min_px_dist）, 用于快速查询某像素周围是否已有特征
+  // size_close是像素级精细网格（缩放因子 = min_px_dist）, 用于快速查询某像素周围是否已有特征点
+  // 每个格子 = min_px_dist x min_px_dist 像素
   cv::Size size_close((int)((float)img0pyr.at(0).cols / (float)min_px_dist),
                       (int)((float)img0pyr.at(0).rows / (float)min_px_dist)); // width x height
-  cv::Mat grid_2d_close = cv::Mat::zeros(size_close, CV_8UC1);
+  cv::Mat grid_2d_close = cv::Mat::zeros(size_close, CV_8UC1); // 标记哪些像素区域已被占用
   float size_x = (float)img0pyr.at(0).cols / (float)grid_x;
   float size_y = (float)img0pyr.at(0).rows / (float)grid_y;
-  // 粗网格，用于统计每个网格单元中的特征点数量
+  // size_grid是粗网格，用于统计分布均匀性
   cv::Size size_grid(grid_x, grid_y); // width x height
-  cv::Mat grid_2d_grid = cv::Mat::zeros(size_grid, CV_8UC1);
+  cv::Mat grid_2d_grid = cv::Mat::zeros(size_grid, CV_8UC1); // 统计每个粗网格单元中的特征数
   cv::Mat mask0_updated = mask0.clone();
   auto it0 = pts0.begin(); // pts0 和 ids0 是一一对应的
   auto it1 = ids0.begin();
-  // 清理越界和不符合条件的旧特征点（靠近边缘、靠近已有特征、在掩码区域内）
+  // 遍历已有点，对每个点进行过滤:
+  // 1. 三种边界检查(图像原图/细网格/粗网格): 如果点在图像边缘 edge 内，则删除该点
+  // 2. 精细网格检查(近邻冲突): 如果点所在的精细网格单元已被占用，则删除该点
+  // 3. 掩码检查: 如果点在掩码区域内（mask0 > 127），则删除该点
+  // 如果点通过了以上检查，则在精细网格标记该点，并增加其在粗网格中的计数，并在 mask0_updated 上绘制一个膨胀矩形，防止在该区域再次检测新特征
   while (it0 != pts0.end()) {
     // Get current left keypoint, check that it is in bounds
+    // 图像金字塔第一层是原图大小!!
     cv::KeyPoint kpt = *it0;
     int x = (int)kpt.pt.x;
     int y = (int)kpt.pt.y;
@@ -478,13 +503,15 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
       continue;
     }
     // Else we are good, move forward to the next point
-    grid_2d_close.at<uint8_t>(y_close, x_close) = 255;
+    grid_2d_close.at<uint8_t>(y_close, x_close) = 255; // 标记该像素区域已被该旧特征点占用
     // 粗网格统计（每个网格单元中的特征点数量）
     if (grid_2d_grid.at<uint8_t>(y_grid, x_grid) < 255) {
       grid_2d_grid.at<uint8_t>(y_grid, x_grid) += 1;
     }
     // Append this to the local mask of the image
     // 被保留的特征在 mask0_updated 周围绘制矩形（膨胀掩膜），避免在同一区域再检测
+    // 九宫格膨胀: 以特征点为中心，向四周扩展 min_px_dist 个像素，形成一个正方形区域 
+    // 其实就是膨胀一个细网格的九邻域，但是因为mask0_updated 是原始图像大小，所以直接用像素坐标绘制矩形
     if (x - min_px_dist >= 0 && x + min_px_dist < img0pyr.at(0).cols && y - min_px_dist >= 0 && y + min_px_dist < img0pyr.at(0).rows) {
       cv::Point pt1(x - min_px_dist, y - min_px_dist);
       cv::Point pt2(x + min_px_dist, y + min_px_dist);
@@ -497,6 +524,7 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
 
   // First compute how many more features we need to extract from this image
   // If we don't need any features, just return
+  // 判断是否需要补点，如果距离最大特征数的比例小于 min_feat_percent或者小于20个点，则不再补点
   double min_feat_percent = 0.50;
   int num_featsneeded = num_features - (int)pts0.size();
   if (num_featsneeded < std::min(20, (int)(min_feat_percent * num_features)))
@@ -509,12 +537,20 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
 
   // We also check a downsampled mask such that we don't extract in areas where it is all masked!
   cv::Mat mask0_grid; // 将原始掩码缩放到粗网格大小，后面直接在这个掩码上判断是否需要提取新特征
-  cv::resize(mask0, mask0_grid, size_grid, 0.0, 0.0, cv::INTER_NEAREST);
+  // 本质就是：把一张 640×480 的掩码图，缩小成一张 5×5 的极小图像。
+  // mask0_grid 里每个像素的值，就是从原图中对应区域采样出的一个 0~255 的灰度值
+  cv::resize(mask0, mask0_grid, size_grid, 0.0, 0.0, cv::INTER_NEAREST); 
+  // cv::INTER_NEAREST最近邻插值：目标像素直接取原图中最近的那个像素的值，不做任何插值，速度最快 
+  // 即每个粗网格单元中心位置的原图掩码值，被当作整个单元的"代表值"。
+  // 为什么用INTER_NEAREST而不是默认的双线性插值?
+  // 掩码是二值语义（0=可检测，255=禁止），不是连续图像，插值平滑没有意义
+  // 最近邻不会产生中间灰度值（如双线性插值会在 0 和 255 之间产生 128 之类的新值），语义干净
+  // 速度最快（只是简单取点，不做加权计算）
 
   // Create grids we need to extract from and then extract our features (use fast with griding)
   // 每个粗网格单元"理想情况下"应该有多少个特征点（用于判断是否需要在该网格单元中提取新特征）
   int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
-  // 实际需要的特征点数量（每个粗网格单元至少需要的特征点数量）
+  // 粗网格最少需要的特征点数量（每个粗网格单元至少需要的特征点数量，低于该数量就认为该网格单元需要补点）
   int num_features_grid_req = std::max(1, (int)(min_feat_percent * num_features_grid));
   std::vector<std::pair<int, int>> valid_locs; // 需要提取新特征的粗网格单元位置
   for (int x = 0; x < grid_2d_grid.cols; x++) {
@@ -525,29 +561,34 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
       }
     }
   }
-  std::vector<cv::KeyPoint> pts0_ext; // 提取出的是亚像素特征点
+  std::vector<cv::KeyPoint> pts0_ext; // 提取出的是亚像素细化后的特征点
+  // img0pyr.at(0)是原图，mask0_updated是与原图大小相同的旧特征膨胀后的掩码，valid_locs是需要提取新特征的粗网格单元位置
+  // 这里提取出来的特征点，是没有落在旧特征膨胀区域内的，且在粗网格单元中均匀分布的
   Grider_GRID::perform_griding(img0pyr.at(0), mask0_updated, valid_locs, pts0_ext, num_features, grid_x, grid_y, threshold, true);
 
   // Now, reject features that are close a current feature
   // 对新检测出的候选特征点做最终的近邻去重过滤
-  // perform_griding只保证了每个粗网格单元内的特征数量均匀，但它不知道当前图像中已有的旧特征在哪里。
-  // 新检测出的点可能恰好落在旧特征的 min_px_dist 邻域内，因此需要用 
-  // grid_2d_close（前面建立的像素级占用网格，记录了所有旧特征的位置）再过滤一遍
-  std::vector<cv::KeyPoint> kpts0_new;
+  // 因为mask0_updated 膨胀掩码管得了"新点 vs 旧特征"，但是管不了"新点 vs 新点"
+  // 膨胀矩形是检测之前由旧特征点一次性画好的，perform_griding 内部只读 mask、不往 mask 里画任何东西。
+  // 而每个粗网格单元最多返回 num_features_grid 个点， 
+  // 比如一个单元里恰好有两个响应都很强的 FAST 角点，相距 3 像素，它们都能通过 mask 检查（因为 mask 里没有矩形挡住它们彼此）
+  // 因此需要用 grid_2d_close（前面建立的像素级精细网格，同时还记录了所有旧特征的位置）再过滤一遍
+  std::vector<cv::KeyPoint> kpts0_new; // 单目版本可以不用!!!
   std::vector<cv::Point2f> pts0_new;
   for (auto &kpt : pts0_ext) {
-    // Check that it is in bounds 把新候选点的像素坐标映射到 close_grid 坐标系，再判断是否越界
+    // Check that it is in bounds 把新候选点的像素坐标映射到细网格坐标系，计算细网格坐标位置，判断是否越界
     int x_grid = (int)(kpt.pt.x / (float)min_px_dist);
     int y_grid = (int)(kpt.pt.y / (float)min_px_dist);
     if (x_grid < 0 || x_grid >= size_close.width || y_grid < 0 || y_grid >= size_close.height)
       continue;
-    // See if there is a point at this location  该格附近已被旧特征占用，跳过
+    // See if there is a point at this location
+    // 该格子已被【旧特征 或 已接受的新点】占用 → 拒绝
     if (grid_2d_close.at<uint8_t>(y_grid, x_grid) > 127)
       continue;
     // Else lets add it!
     kpts0_new.push_back(kpt);
     pts0_new.push_back(kpt.pt);
-    grid_2d_close.at<uint8_t>(y_grid, x_grid) = 255;
+    grid_2d_close.at<uint8_t>(y_grid, x_grid) = 255; // 接受一个新特征点，就标记一个细网格
   }
 
   // Loop through and record only ones that are valid
@@ -558,7 +599,7 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
   for (size_t i = 0; i < pts0_new.size(); i++) {
     // update the uv coordinates
     kpts0_new.at(i).pt = pts0_new.at(i);
-    // append the new uv coordinate
+    // append the new uv coordinate 添加亚像素坐标
     pts0.push_back(kpts0_new.at(i));
     // move id foward and append this new point
     size_t temp = ++currid;
