@@ -96,7 +96,7 @@ void TrackKLT::feed_new_camera(const CameraData &message) {
 
 /**
  * @brief Feeds a monocular image to the KLT tracker, performing feature detection and tracking.
- * 上一帧特征 → 补充检测(topo-off) → KLT跟踪 → RANSAC去外点 → 更新数据库 → 推进到下一帧
+ * 上一帧特征 → 补充检测(top-off) → KLT跟踪 → RANSAC去外点 → 更新数据库 → 推进到下一帧
  * @param message The camera data containing images and masks.
  * @param msg_id The index of the image within the message to process.
  */
@@ -162,12 +162,13 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   std::vector<cv::KeyPoint> pts_left_new = pts_left_match; // 初始猜测
 
   // Lets track temporally
-  // KLT 光流跟踪，返回的是畸变像素坐标。且 pts_left_match 和 pts_left_new 会被原地更新。
+  // KLT 光流跟踪，返回的是带畸变的亚像素坐标。且 pts_left_new 会被原地更新， mask_ll 是经过光流跟踪和 RANSAC 过滤后的有效点标志
   perform_matching(img_pyramid_last[cam_id], imgpyr, pts_left_match, pts_left_new, cam_id, cam_id, mask_ll);
   assert(pts_left_new.size() == ids_left_match.size());
   rT4 = boost::posix_time::microsec_clock::local_time();
 
   // If any of our mask is empty, that means we didn't have enough to do ransac, so just return
+  // 触发这个条件的原因是：如果上一帧的特征点太少(< 10)，无法进行 RANSAC 估计基础矩阵，那么 mask_ll 就会为空，说明没有有效的跟踪点。
   if (mask_ll.empty()) {
     std::lock_guard<std::mutex> lckv(mtx_last_vars);
     img_last[cam_id] = img;
@@ -184,6 +185,10 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   std::vector<size_t> good_ids_left;    // 对应的特征点 ID(唯一ID)
 
   // Loop through all left points
+  // 三层过滤进行有效点筛选: 
+  // 1. 越界检查: 负坐标或超出图像范围的点直接丢弃
+  // 2. 掩膜检查: 如果点在掩膜区域内(mask>127)，说明该点在ROI外，丢弃
+  // 3. KLT跟踪检查: mask_ll[i]为1表示该点跟踪成功，否则丢弃
   for (size_t i = 0; i < pts_left_new.size(); i++) {
     // Ensure we do not have any bad KLT tracks (i.e., points are negative) 越界检查
     if (pts_left_new.at(i).pt.x < 0 || pts_left_new.at(i).pt.y < 0 || (int)pts_left_new.at(i).pt.x >= img.cols ||
@@ -909,18 +914,19 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
 /**
  * @brief Perform KLT matching between two sets of keypoints in image pyramids.
  * 
- * @param img0pyr Image pyramid of the first image.
- * @param img1pyr Image pyramid of the second image.
- * @param kpts0 Keypoints in the first image. 原地更新，返回的是畸变像素坐标。
- * @param kpts1 Keypoints in the second image. 原地更新，返回的是畸变像素坐标。
- * @param id0 Camera calibration ID for the first image.
- * @param id1 Camera calibration ID for the second image.
- * @param mask_out Output mask indicating successfully tracked points.
+ * @param img0pyr Image pyramid of the first image.上一帧的图像金字塔，包含多层分辨率的图像。
+ * @param img1pyr Image pyramid of the second image.当前帧的图像金字塔，包含多层分辨率的图像。
+ * @param kpts0 Keypoints in the first image.  [in/out] 起始点（会被原地更新）畸变亚像素坐标。
+ * @param kpts1 Keypoints in the second image. [in/out] 目标点，同时作为初始猜测，畸变亚像素坐标。
+ * @param id0 Camera calibration ID for the first image. 上一帧的相机ID
+ * @param id1 Camera calibration ID for the second image. 当前帧的相机ID
+ * @param mask_out Output mask indicating successfully tracked points. 输出的维度与 kpts0/kpts1 相同，表示每个点的跟踪状态。
+ * [out] mask_out[i]=1 表示第 i 个点跟踪成功，mask_out[i]=0 表示第 i 个点跟踪失败。
  */
 void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, std::vector<cv::KeyPoint> &kpts0,
                                 std::vector<cv::KeyPoint> &kpts1, size_t id0, size_t id1, std::vector<uchar> &mask_out) {
 
-  // We must have equal vectors
+  // We must have equal vectors 输入检查，保证两个向量登场
   assert(kpts0.size() == kpts1.size());
 
   // Return if we don't have any points
@@ -936,7 +942,7 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
 
   // If we don't have enough points for ransac just return empty
   // We set the mask to be all zeros since all points failed RANSAC
-  // 点数不足无法进行 RANSAC，设置 mask 为全 0
+  // 点数不足无法进行 RANSAC，设置 mask 为全 0，让上层走"重置跟踪"逻辑
   if (pts0.size() < 10) {
     for (size_t i = 0; i < pts0.size(); i++)
       mask_out.push_back((uchar)0);
@@ -948,14 +954,26 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
   std::vector<float> error;
   cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01);
   /** 金字塔的作用：从粗到精逐层搜索，先在低分辨率层找大致位移，再在高分辨率层精化，能处理较大的帧间运动。
-   * mask_klt[i]=1 表示第 i 个点跟踪成功。
+   * pts1的变化(关键细节)：
+   *   场景A: 传入空的pts1(最常见)，函数会在内部会自动将 pts1 resize 为与 pts0 完全相同的大小，然后计算出新坐标并更新pts1。
+   *   场景B: 传入已有的pts1并开启 cv::OPTFLOW_USE_INITIAL_FLOW标志，函数会把pts1里已有的位置当作初始猜测进行迭代优化，加速收敛，计算出新坐标并更新pts1。
+   * 关于失败点(status):
+   * 虽然pts1 的大小永远是pts0.size()，但是并不是每个点都追踪成功。
+   * mask_klt[i]=1 表示第 i 个点跟踪成功，pts1[i] 是有效的跟踪结果。
+   * mask_klt[i]=0 表示第 i 个点跟踪失败(点跑出图像、被遮挡或纹理不佳)，pts1[i]的值依然会被填入(通常保持为初始猜测坐标或者边界裁剪后的值)，但是这个坐标是不可靠的。
+   * 所以我们必须结合status进行筛选(mask_klt 即 status)。
+   *
    cv::calcOpticalFlowPyrLK(
-    img0pyr, img1pyr,       // 前一帧 → 当前帧金字塔
-    pts0, pts1,             // 输入：旧坐标  输出：新坐标（in-place更新）
-    mask_klt, error,        // 跟踪状态掩膜 & 误差
-    win_size, pyr_levels,   // 窗口15×15，5层金字塔
-    term_crit,              // 最多30次迭代或收敛到0.01像素
-    cv::OPTFLOW_USE_INITIAL_FLOW  // 用pts1作为初始猜测，加速收敛
+    img0pyr,    // 前一帧金字塔
+    img1pyr,    // 当前帧金字塔
+    pts0,       // 输入: 前一帧的特征点坐标  在函数前后，其内容、大小和顺序均完全不变
+    pts1,       // 输出: 新坐标（in-place更新） 在函数后，其大小保持与 prevPts 完全一致，但内容被更新为计算出的新坐标
+    mask_klt,   // 输出: 跟踪状态标志(mask_klt[i]=1 表示第 i 个点跟踪成功)
+    error,      // 输出: 跟踪误差
+    win_size,   // 搜索窗口大小(15×15)，窗口越大，越能处理大运动，但计算量也越大
+    pyr_levels, // 金字塔最大层数
+    term_crit,  // 迭代算法终止条件，最多30次迭代或收敛到0.01像素
+    cv::OPTFLOW_USE_INITIAL_FLOW  // 把 pts1 里已有的位置当作初始猜测，加速收敛——这正是上层"top-off 补点 / 双目左右匹配"传入上一帧或右图位置的原因
   );
    */
   cv::calcOpticalFlowPyrLK(img0pyr, img1pyr, pts0, pts1, mask_klt, error, win_size, pyr_levels, term_crit, cv::OPTFLOW_USE_INITIAL_FLOW);
@@ -975,13 +993,14 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
   }
 
   // Do RANSAC outlier rejection (note since we normalized the max pixel error is now in the normalized cords)
+  // RANSAC 过滤什么？ 光流跟丢 / 动态物体 / 错误匹配等几何不一致的点
   std::vector<uchar> mask_rsc;
   double max_focallength_img0 = std::max(camera_calib.at(id0)->get_K()(0, 0), camera_calib.at(id0)->get_K()(1, 1));
   double max_focallength_img1 = std::max(camera_calib.at(id1)->get_K()(0, 0), camera_calib.at(id1)->get_K()(1, 1));
   double max_focallength = std::max(max_focallength_img0, max_focallength_img1);
   // RANSAC 阈值归一化：2像素 / 焦距 = 归一化坐标误差
   // 用 max_focallength 做归一化，使阈值在不同相机（不同焦距）下语义一致，都对应约 2 像素的重投影误差。
-  /**
+  /** RANSAC 估计基础矩阵 F
     cv::Mat cv::findFundamentalMat(
         InputArray points1,   // 第一幅图像中的点
         InputArray points2,   // 第二幅图像中的点
@@ -995,13 +1014,13 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
 
   // Loop through and record only ones that are valid
   // 两个掩膜取 AND：KLT成功 且 RANSAC内点
-  // KLT 过滤光流本身失败的点（纹理消失、遮挡等）， RANSAC 过滤几何不一致的点（动态物体、大误差累积）
+  // KLT 过滤光流本身失败的点（纹理消失、遮挡等）， RANSAC 过滤几何不一致的点（动态物体、大误差累积、误匹配）
   for (size_t i = 0; i < mask_klt.size(); i++) {
     auto mask = (uchar)((i < mask_klt.size() && mask_klt[i] && i < mask_rsc.size() && mask_rsc[i]) ? 1 : 0);
     mask_out.push_back(mask);
   }
 
-  // Copy back the updated positions
+  // Copy back the updated positions 返回的还是带畸变的亚像素坐标
   for (size_t i = 0; i < pts0.size(); i++) {
     kpts0.at(i).pt = pts0.at(i);
     kpts1.at(i).pt = pts1.at(i);

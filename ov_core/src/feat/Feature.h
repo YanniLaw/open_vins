@@ -39,7 +39,7 @@ namespace ov_core {
 class Feature {
 
 public:
-  /// Unique ID of this feature 全局唯一ID
+  /// Unique ID of this feature 特征点全局唯一ID
   size_t featid;
 
   /// If this feature should be deleted 该特征点是否应该被删除

@@ -333,8 +333,9 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
 }
 
 /**
- * @brief 核心处理函数，负责完成状态传播 → MSCKF 更新 → SLAM 更新 → 边缘化 的完整 EKF 迭代
- * 
+ * @brief 核心处理函数，完成"一次相机帧触发的完整 EKF 处理"：传播 → 选特征 → MSCKF/SLAM 更新 → 边缘化
+ * 整体结构为: 
+ * 传播+克隆 → 特征收集与分类 → MSCKF更新 → SLAM更新/延迟初始化 → 可视化重三角化 → 清理与边缘化 → 统计输出
  * @param message 当前帧相机测量数据，包含时间戳、相机ID、图像数据和掩码（如果使用
  */
 void VioManager::do_feature_propagate_update(const ov_core::CameraData &message) {
@@ -344,7 +345,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   //===================================================================================
 
   // Return if the camera measurement is out of order
-  // 如果相机帧的时间戳早于当前状态时间，说明乱序到达，直接返回
+  // 乱序保护: 如果相机帧的时间戳早于当前状态时间，说明乱序到达，直接返回
   if (state->_timestamp > message.timestamp) {
     PRINT_WARNING(YELLOW "image received out of order, unable to do anything (prop dt = %3f)\n" RESET,
                   (message.timestamp - state->_timestamp));
@@ -387,6 +388,11 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
   // Now, lets get all features that should be used for an update that are lost in the newest frame
   // We explicitly request features that have not been deleted (used) in another update step
+  // 特征收集（从特征数据库取候选）
+  // feats_lost: 在当前最新帧中丢失的特征（也就是在当前帧中没有观测，可用于 MSCKF 更新）
+  // feats_marg: 含最老克隆时刻的特征（待边缘化），可用于 MSCKF 更新
+  // feats_slam: aruco 库中含边缘化时刻的特征（可用于 SLAM 更新），且满足最大轨迹长度条件（可用于 SLAM 更新）
+  // 这些特征将被分类为不同的更新类型，以便在后续步骤中进行 MSCKF 或 SLAM 更新
   std::vector<std::shared_ptr<Feature>> feats_lost, feats_marg, feats_slam;
   feats_lost = trackFEATS->get_feature_database()->features_not_containing_newer(state->_timestamp, false, true);
 

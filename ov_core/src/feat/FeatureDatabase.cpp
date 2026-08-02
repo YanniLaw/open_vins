@@ -59,19 +59,19 @@ bool FeatureDatabase::get_feature_clone(size_t id, Feature &feat) {
 /**
  * @brief Update or add a feature with the given observation.
  * 
- * @param id Feature ID
+ * @param id Feature ID 特征点唯一ID
  * @param timestamp Timestamp of the observation
- * @param cam_id Camera ID
- * @param u Pixel x-coordinate 带畸变像素坐标
- * @param v Pixel y-coordinate 带畸变像素坐标
- * @param u_n Normalized x-coordinate  去畸变归一化坐标
- * @param v_n Normalized y-coordinate  去畸变归一化坐标
+ * @param cam_id Camera ID 特征点观测的相机ID
+ * @param u Pixel x-coordinate 带畸变亚像素坐标u
+ * @param v Pixel y-coordinate 带畸变亚像素坐标v
+ * @param u_n Normalized x-coordinate  去畸变归一化坐标x
+ * @param v_n Normalized y-coordinate  去畸变归一化坐标y
  */
 void FeatureDatabase::update_feature(size_t id, double timestamp, size_t cam_id, float u, float v, float u_n, float v_n) {
 
   // Find this feature using the ID lookup
   std::lock_guard<std::mutex> lck(mtx);
-  if (features_idlookup.find(id) != features_idlookup.end()) { // 该特征点已存在数据库中
+  if (features_idlookup.find(id) != features_idlookup.end()) { // 该特征点已存在数据库中，就新增观测数据
     // Get our feature
     std::shared_ptr<Feature> feat = features_idlookup.at(id);
     // Append this new information to it!
@@ -84,7 +84,7 @@ void FeatureDatabase::update_feature(size_t id, double timestamp, size_t cam_id,
   // Debug info
   // PRINT_DEBUG("featdb - adding new feature %d",(int)id);
 
-  // Else we have not found the feature, so lets make it be a new one! 该特征点不在数据库中 
+  // Else we have not found the feature, so lets make it be a new one! 该特征点不在数据库中，新增该特征点数据
   std::shared_ptr<Feature> feat = std::make_shared<Feature>();
   feat->featid = id;
   feat->uvs[cam_id].push_back(Eigen::Vector2f(u, v));
@@ -95,29 +95,49 @@ void FeatureDatabase::update_feature(size_t id, double timestamp, size_t cam_id,
   features_idlookup[id] = feat;
 }
 
+/**
+ * @brief Get all features that contain measurements older than the specified timestamp.
+ * 这个函数用于从特征数据库里找出"没有比指定时间更新的观测"的特征——也就是在当前帧没有新观测、已经"跟丢"的特征。
+ * 在 VioManager::do_feature_propagate_update 中它是获取 MSCKF 待更新特征的第一步
+ * @param timestamp  // 判断基准时间（通常是当前帧时间戳）
+ * @param remove     // 是否从数据库中移除命中的特征  	通常先取出来（不删），供更新使用；真正删除由后续 cleanup() 统一做
+ * @param skip_deleted // 是否跳过已标记删除的特征     传入 true，避免把已在其他更新中用过（to_delete 标记）的特征再次取出
+ * @return std::vector<std::shared_ptr<Feature>> Vector of features containing older measurements
+ * 为什么要 skip_deleted？
+ * 因为跟踪与估计可能是异步的（FeatureDatabase 头文件注释里专门提到这一点）:
+ *    - 多相机异步跟踪时，更新用的特征在取出后会被标记 to_delete
+ *    - 若不禁用这些特征，下一帧更新时可能重复使用同一批特征，导致信息被重复计入滤波器，破坏一致性
+ *    - skip_deleted = true 保证"已用过"的特征不会再次进入更新流程
+ */
 std::vector<std::shared_ptr<Feature>> FeatureDatabase::features_not_containing_newer(double timestamp, bool remove, bool skip_deleted) {
 
   // Our vector of features that do not have measurements after the specified time
   std::vector<std::shared_ptr<Feature>> feats_old;
 
   // Now lets loop through all features, and just make sure they are not old
+  // features_idlookup key为特征点唯一ID，value为对应的特征点对象
   std::lock_guard<std::mutex> lck(mtx);
   for (auto it = features_idlookup.begin(); it != features_idlookup.end();) {
-    // Skip if already deleted
+    // Skip if already deleted 跳过已标记删除的特征
     if (skip_deleted && (*it).second->to_delete) {
       it++;
       continue;
     }
     // Loop through each camera
     // If we have a measurement greater-than or equal to the specified, this measurement is find
+    // 检查该特征是否在 timestamp 之后还有观测
+    // 为什么是用最后一个时间戳来判断?
+    // 因为每个 Feature 内部用 timestamps[cam_id] 存按时间排序的观测序列（跟踪时用 push_back 追加，天然有序）
+    // 只要任一相机的最新观测 >= timestamp，就认为该特征"仍在被跟踪"，不放入结果中
     bool has_newer_measurement = false;
-    for (auto const &pair : (*it).second->timestamps) {
+    for (auto const &pair : (*it).second->timestamps) { // 遍历该特征所有的观测时间戳列表
       has_newer_measurement = (!pair.second.empty() && pair.second.at(pair.second.size() - 1) >= timestamp);
       if (has_newer_measurement) {
         break;
       }
     }
     // If it is not being actively tracked, then it is old
+    // 若没有更新的观测 → 记为"跟丢"特征
     if (!has_newer_measurement) {
       feats_old.push_back((*it).second);
       if (remove)
