@@ -68,6 +68,7 @@ struct StateOptions {
   int max_clone_size = 11;
 
   /// Max number of estimated SLAM features
+  /// 配置的普通SLAM特征点(非aruco特征)数量上限
   int max_slam_features = 25;
 
   /// Max number of SLAM features we allow to be included in a single EKF update.
@@ -77,6 +78,7 @@ struct StateOptions {
   int max_msckf_in_update = 1000;
 
   /// Max number of estimated ARUCO features
+  /// 配置的aruco特征点数量上限
   int max_aruco_features = 1024;
 
   /// Number of distinct cameras that we will observe features in

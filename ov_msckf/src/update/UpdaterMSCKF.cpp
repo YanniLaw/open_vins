@@ -41,13 +41,14 @@ using namespace ov_msckf;
 
 UpdaterMSCKF::UpdaterMSCKF(UpdaterOptions &options, ov_core::FeatureInitializerOptions &feat_init_options) : _options(options) {
 
-  // Save our raw pixel noise squared
+  // Save our raw pixel noise squared 像素噪声方差
   _options.sigma_pix_sq = std::pow(_options.sigma_pix, 2);
 
-  // Save our feature initializer
+  // Save our feature initializer 三角化器
   initializer_feat = std::shared_ptr<ov_core::FeatureInitializer>(new ov_core::FeatureInitializer(feat_init_options));
 
   // Initialize the chi squared test table with confidence level 0.95
+  // 预计算卡方 95% 分位点表（自由度 1~499）
   // https://github.com/KumarRobotics/msckf_vio/blob/050c50defa5a7fd9a04c1eed5687b405f02919b5/src/msckf_vio.cpp#L215-L221
   for (int i = 1; i < 500; i++) {
     boost::math::chi_squared chi_squared_dist(i);
@@ -55,6 +56,13 @@ UpdaterMSCKF::UpdaterMSCKF(UpdaterOptions &options, ov_core::FeatureInitializerO
   }
 }
 
+/**
+ * @brief Will compute the system for our sparse features and update the filter.
+ * 这是 MSCKF 更新的主执行函数：输入一批特征（feature_vec），输出对状态的 EKF 校正。
+ * 整体是一条流水线：清理 → 准备相机位姿 → 三角化 → 构造线性系统（含零空间投影+卡方剔除）→ 测量压缩 → EKF 更新
+ * @param state State of the filter
+ * @param feature_vec Features that can be used for update
+ */
 void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec) {
 
   // Return if no features
@@ -76,16 +84,16 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   while (it0 != feature_vec.end()) {
 
     // Clean the feature
-    (*it0)->clean_old_measurements(clonetimes);
+    (*it0)->clean_old_measurements(clonetimes); // 只保留该特征点在克隆时刻上的测量
 
-    // Count how many measurements
+    // Count how many measurements 统计该特征的总测量数
     int ct_meas = 0;
     for (const auto &pair : (*it0)->timestamps) {
       ct_meas += (*it0)->timestamps[pair.first].size();
     }
 
     // Remove if we don't have enough
-    if (ct_meas < 2) {
+    if (ct_meas < 2) { // 少于 2 个 → 无法三角化 → 剔除
       (*it0)->to_delete = true;
       it0 = feature_vec.erase(it0);
     } else {
@@ -94,32 +102,34 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   }
   rT1 = boost::posix_time::microsec_clock::local_time();
 
-  // 2. Create vector of cloned *CAMERA* poses at each of our clone timesteps
+  // 2. Create vector of cloned *CAMERA* poses at each of our clone timesteps  构建相机位姿克隆图
   std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> clones_cam;
-  for (const auto &clone_calib : state->_calib_IMUtoCAM) {
+  for (const auto &clone_calib : state->_calib_IMUtoCAM) { // 遍历每个相机
 
     // For this camera, create the vector of camera poses
     std::unordered_map<double, FeatureInitializer::ClonePose> clones_cami;
     for (const auto &clone_imu : state->_clones_IMU) {
 
-      // Get current camera pose
+      // Get current camera pose 对每个相机 × 每个克隆时刻，计算相机在世界系下的位姿
       Eigen::Matrix<double, 3, 3> R_GtoCi = clone_calib.second->Rot() * clone_imu.second->Rot();
       Eigen::Matrix<double, 3, 1> p_CioinG = clone_imu.second->pos() - R_GtoCi.transpose() * clone_calib.second->pos();
 
-      // Append to our map
+      // Append to our map key 为克隆时刻，value 为相机位姿
       clones_cami.insert({clone_imu.first, FeatureInitializer::ClonePose(R_GtoCi, p_CioinG)});
     }
 
-    // Append to our map
+    // Append to our map key 为相机索引，value 为该相机在各克隆时刻的位姿
     clones_cam.insert({clone_calib.first, clones_cami});
   }
 
   // 3. Try to triangulate all MSCKF or new SLAM features that have measurements
+  // 用多视角观测三角化出特征 3D 位置，再用高斯牛顿精化。失败（退化、射线平行）→ 剔除，避免带病特征进更新。
   auto it1 = feature_vec.begin();
   while (it1 != feature_vec.end()) {
 
     // Triangulate the feature and remove if it fails
     bool success_tri = true;
+    // 两种三角化方式（1D 逆深度 or 3D）
     if (initializer_feat->config().triangulate_1d) {
       success_tri = initializer_feat->single_triangulation_1d(*it1, clones_cam);
     } else {
@@ -127,12 +137,13 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     }
 
     // Gauss-newton refine the feature
+    // 高斯牛顿精化（可选，默认开）
     bool success_refine = true;
     if (initializer_feat->config().refine_features) {
       success_refine = initializer_feat->single_gaussnewton(*it1, clones_cam);
     }
 
-    // Remove the feature if not a success
+    // Remove the feature if not a success 任一失败 → 剔除
     if (!success_tri || !success_refine) {
       (*it1)->to_delete = true;
       it1 = feature_vec.erase(it1);

@@ -46,9 +46,11 @@ public:
   size_t _featid;
 
   /// What unique camera stream this slam feature was observed from
+  /// 特征第一次被观测时的那个相机ID（用于多相机系统区分不同相机）不可变
   int _unique_camera_id = -1;
 
   /// What camera ID our pose is anchored in!! By default the first measurement is the anchor.
+  /// 锚点相机ID， 可变
   int _anchor_cam_id = -1;
 
   /// Timestamp of anchor clone

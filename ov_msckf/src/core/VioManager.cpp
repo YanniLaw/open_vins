@@ -390,7 +390,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // We explicitly request features that have not been deleted (used) in another update step
   // 特征收集（从特征数据库取候选）
   // feats_lost: 在当前最新帧中丢失的特征（也就是在当前帧中没有观测，可用于 MSCKF 更新）
-  // feats_marg: 含最老克隆时刻的特征（待边缘化），可用于 MSCKF 更新
+  // feats_marg: 含最老克隆时刻的特征（待边缘化，可用于 MSCKF 更新)
   // feats_slam: aruco 库中含边缘化时刻的特征（可用于 SLAM 更新），且满足最大轨迹长度条件（可用于 SLAM 更新）
   // 这些特征将被分类为不同的更新类型，以便在后续步骤中进行 MSCKF 或 SLAM 更新
   std::vector<std::shared_ptr<Feature>> feats_lost, feats_marg, feats_slam;
@@ -407,6 +407,8 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // Remove any lost features that were from other image streams
   // E.g: if we are cam1 and cam0 has not processed yet, we don't want to try to use those in the update yet
   // E.g: thus we wait until cam0 process its newest image to remove features which were seen from that camera
+  // 过滤 feats_lost 中不来自当前相机的特征
+  // 如果特征是在 cam0 观测的，但当前处理的是 cam1 的帧，则等待 cam0 处理完再使用，防止多相机异步时提前使用未完整的观测
   auto it1 = feats_lost.begin();
   while (it1 != feats_lost.end()) {
     bool found_current_message_camid = false;
@@ -425,6 +427,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
   // We also need to make sure that the max tracks does not contain any lost features
   // This could happen if the feature was lost in the last frame, but has a measurement at the marg timestep
+  // 排除 feats_lost 中同时在 feats_marg 里的特征（避免重复使用）
   it1 = feats_lost.begin();
   while (it1 != feats_lost.end()) {
     if (std::find(feats_marg.begin(), feats_marg.end(), (*it1)) != feats_marg.end()) {
@@ -436,6 +439,10 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   }
 
   // Find tracks that have reached max length, these can be made into SLAM features
+  // 从边缘化的特征 feats_marg 中找出达到最大轨迹长度的特征 → 提升为 SLAM 特征
+  // feats_maxtracks: 任一相机轨迹长度 > max_clone_size 的特征
+  // 这些长轨迹特征适合作为 SLAM 路标（持久化、带深度估计）
+  // 这里是只要满足长轨迹就可以提升为 SLAM 特征，并没有按照轨迹长度进行排序或优先级选择
   std::vector<std::shared_ptr<Feature>> feats_maxtracks;
   auto it2 = feats_marg.begin();
   while (it2 != feats_marg.end()) {
@@ -450,16 +457,20 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     // If max track, then add it to our possible slam feature list
     if (reached_max) {
       feats_maxtracks.push_back(*it2);
-      it2 = feats_marg.erase(it2);
+      it2 = feats_marg.erase(it2); // 同时从 feats_marg 中移除，避免重复使用
     } else {
       it2++;
     }
   }
 
   // Count how many aruco tags we have in our state
+  // 统计当前 SLAM 路标中的 aruco 标签的特征点数量，按配额补充新 SLAM 特征
+  // 每个 aruco 标签有 4 个角点 → 最多 4 * max_aruco_features 个 aruco 特征
+  // OpenVINS 约定：aruco 角点 ID 落在 [1, 4*max_aruco_features]，TrackKLT/TrackDescriptor跟踪的普通特征 ID 从 max_aruco_features 之后开始
   int curr_aruco_tags = 0;
   auto it0 = state->_features_SLAM.begin();
   while (it0 != state->_features_SLAM.end()) {
+    // 这里为什么是 4 * max_aruco_features 呢？因为每个 aruco 标签有 4 个特征点（角点），所以总特征数是标签数的 4 倍
     if ((int)(*it0).second->_featid <= 4 * state->_options.max_aruco_features)
       curr_aruco_tags++;
     it0++;
@@ -467,14 +478,33 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
 
   // Append a new SLAM feature if we have the room to do so
   // Also check that we have waited our delay amount (normally prevents bad first set of slam points)
+  // 这里为什么要补充这么多普通SLAM特征?? 
+  // 这是 OpenVINS 采用 MSCKF + SLAM 混合架构的原因。补普通 SLAM 特征（最多 max_slam_features 个）有以下目的: 
+  // 1. 提供长期约束，抑制漂移
+  //  - MSCKF 特征用完就边缘化掉，只提供短期约束
+  //  - SLAM 路标常驻状态向量，能跨越多帧（甚至跨越整个轨迹）持续约束位姿，大幅降低累积漂移
+  // 2. 提高可观测性： 相比纯 MSCKF，SLAM 路标让系统能更好地估计重力方向、IMU 标定等量，提高整体精度
+  // 3. 对短/遮挡轨迹的鲁棒性： 短轨迹特征一丢失就失去作用，而 SLAM 路标即使短暂遮挡，恢复后仍可重投影约束，更鲁棒
+  // 4. 为什么是"补满"配额而不是一次加完？
+  //  - feats_maxtracks 是"轨迹达到最大长度"的特征（已经积累了很多观测，三角化质量高），是 SLAM 特征的优质候选
+  //  - 每帧只把普通特征补到 max_slam_features 个，多余的留在 feats_maxtracks 里继续走 MSCKF 更新，形成"持续补充、动态替换"的机制——掉一个 SLAM 特征就补一个
+  // 之所以每帧都补，是为了维持一组长寿命、高质量的 SLAM 路标，用它们换取 MSCKF 的长期精度和鲁棒性
+
+  // 总容量 = 普通配额 + 当前已在状态的 aruco 路标数
   if (state->_options.max_slam_features > 0 && message.timestamp - startup_time >= params.dt_slam_delay &&
+      // 这里的 + curr_aruco_tags 的用意是：aruco 标签不受 max_slam_features 限制，它们是在普通配额之上额外占用的。
       (int)state->_features_SLAM.size() < state->_options.max_slam_features + curr_aruco_tags) {
     // Get the total amount to add, then the max amount that we can add given our marginalize feature array
+    // 计算当前可以添加的 普通SLAM特征点数量，确保不会超过最大 SLAM 特征数限制，同时也不会超过 feats_maxtracks 中可用的特征数量(因为就是从 feats_maxtracks 中挑选的)
+    // _features_SLAM中的aruco特征不计入 max_slam_features 限制，因此需要加上 curr_aruco_tags
     int amount_to_add = (state->_options.max_slam_features + curr_aruco_tags) - (int)state->_features_SLAM.size();
     int valid_amount = (amount_to_add > (int)feats_maxtracks.size()) ? (int)feats_maxtracks.size() : amount_to_add;
     // If we have at least 1 that we can add, lets add it!
     // Note: we remove them from the feat_marg array since we don't want to reuse information...
     if (valid_amount > 0) {
+      // TODO： 这里没有进行轨迹长度排序或优先级选择，直接取 feats_maxtracks 中最后 valid_amount 个特征作为 SLAM 特征，可能不是最优策略
+      // 将 feats_maxtracks 中的最后 valid_amount 个特征添加到 feats_slam 中，作为新的 SLAM 特征
+      // 同时从 feats_maxtracks 中移除这些特征，避免重复使用
       feats_slam.insert(feats_slam.end(), feats_maxtracks.end() - valid_amount, feats_maxtracks.end());
       feats_maxtracks.erase(feats_maxtracks.end() - valid_amount, feats_maxtracks.end());
     }
@@ -485,20 +515,43 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // NOTE: we only enforce this if the current camera message is where the feature was seen from
   // NOTE: if you do not use FEJ, these types of slam features *degrade* the estimator performance....
   // NOTE: we will also marginalize SLAM features if they have failed their update a couple times in a row
+  // 遍历当前 EKF 状态中所有的 SLAM 路标（state->_features_SLAM），
+  // 对每个路标做两件事：① 收集观测用于本次 SLAM 更新；② 判断是否该把某个失效的路标边缘化掉。
+  // 这段循环是"SLAM 路标健康管理"：
+  // 一方面把每个路标的最新观测收集进 feats_slam 用于本次更新; 
+  // 另一方面识别出"真跟丢"（用 current_unique_cam 排除多相机异步的假象）和"反复更新失败"的路标，
+  // 标记 should_marg 以便随后的 marginalize_slam 把它们清理出状态，防止死路标长期占用状态维度、拖累估计精度
   for (std::pair<const size_t, std::shared_ptr<Landmark>> &landmark : state->_features_SLAM) {
+    // 为什么查两个库？ 因为状态里的 SLAM 路标可能来自两类：
+    // aruco 角点路标：观测由 trackARUCO 跟踪，存在 aruco 特征库
+    // 普通 SLAM 路标：观测由 trackFEATS（KLT/Descriptor）跟踪，存在主特征库
+    // 一个路标只会出现在其中一个库里，所以两个都查、只 push 找到的那个。
+    // 这些 Feature 会被加入 feats_slam，稍后在 SLAM 更新阶段（updaterSLAM->update）用来对状态做重投影校正。
+    // 注意：feats_slam 里也可能有重复（比如同一个 featid 同时在两个库里，或前面 feats_maxtracks 已 push 过），后面 delayed_init / update 会有相应处理，这里先不展开。
+    // 1. 先从 aruco 特征库找（如果这个路标是 aruco 角点，它的观测在 aruco 库里）
     if (trackARUCO != nullptr) {
       std::shared_ptr<Feature> feat1 = trackARUCO->get_feature_database()->get_feature(landmark.second->_featid);
       if (feat1 != nullptr)
         feats_slam.push_back(feat1);
     }
+    // 2. 再从主特征库找（普通 SLAM 特征的观测在这里）
     std::shared_ptr<Feature> feat2 = trackFEATS->get_feature_database()->get_feature(landmark.second->_featid);
     if (feat2 != nullptr)
       feats_slam.push_back(feat2);
     assert(landmark.second->_unique_camera_id != -1);
+    // 判断是否需要边缘化该路标（关键逻辑）
+    // 条件1：普通SLAM特征数据库中找不到该路标的观测（跟丢了）且当前相机正是它的"专属相机"
+    // 这里引入了 _unique_camera_id（路标唯一关联的相机，通常是首次检测到它的相机）和 current_unique_cam（当前处理的相机消息是否就是那个相机）
+    // 为什么 feat2 == nullptr 还要判断 current_unique_cam？
+    // 这是多相机异步机制下的保护：
+    // feat2 == nullptr 表示普通SLAM特征数据库库中当前没有该路标的特征记录了——可能是真跟丢，也可能只是该相机还没处理到最新帧（异步）
+    // 只有当当前相机就是该路标的专属相机时，"数据库里没有观测"才意味着"真丢了"（该相机已经处理完它的帧，仍没观测到它）
+    // 如果当前是别的相机在处理，feat2 == nullptr 可能是暂时的，不能贸然边缘化，所以用 current_unique_cam 过滤
     bool current_unique_cam =
         std::find(message.sensor_ids.begin(), message.sensor_ids.end(), landmark.second->_unique_camera_id) != message.sensor_ids.end();
     if (feat2 == nullptr && current_unique_cam)
       landmark.second->should_marg = true;
+    // 条件2：连续多次更新失败，如果该路标在更新中连续失败超过一次（比如重投影残差过大、三角化质量差），说明它可能是个退化路标，也应该边缘化掉。
     if (landmark.second->update_fail_count > 1)
       landmark.second->should_marg = true;
   }
@@ -506,23 +559,39 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // Lets marginalize out all old SLAM features here
   // These are ones that where not successfully tracked into the current frame
   // We do *NOT* marginalize out our aruco tags landmarks
+  // 把标记为 should_marg 的路标从状态中边缘化掉
   StateHelper::marginalize_slam(state);
 
   // Separate our SLAM features into new ones, and old ones
+  // 把本帧收集到的所有 SLAM 特征（feats_slam）按"是否已经进入 EKF 状态"分成两类——已初始化的走"更新"，未初始化的走"延迟初始化"。
+  // 为什么叫 DELAYED（延迟）? 因为这些特征已经在前端跟踪了很多帧（feats_maxtracks 就是轨迹长度超过 max_clone_size 的特征），
+  // 观测积累够了，才在此时被"延迟地"三角化并初始化进状态，而不是一开始检测到就初始化。
+  // feats_slam 的来源有多个：aruco 库的特征、feats_maxtracks 提升的特征、以及当前状态路标在 tracker 库里的观测。
+  // 而就在这段代码之前，StateHelper::marginalize_slam(state) 已经把标记 should_marg 的路标从 _features_SLAM 里删掉了。
   std::vector<std::shared_ptr<Feature>> feats_slam_DELAYED, feats_slam_UPDATE;
   for (size_t i = 0; i < feats_slam.size(); i++) {
     if (state->_features_SLAM.find(feats_slam.at(i)->featid) != state->_features_SLAM.end()) {
-      feats_slam_UPDATE.push_back(feats_slam.at(i));
+      feats_slam_UPDATE.push_back(feats_slam.at(i)); // 已初始化的旧路标，需要用它最新的观测做状态更新
       // PRINT_DEBUG("[UPDATE-SLAM]: found old feature %d (%d
       // measurements)\n",(int)feats_slam.at(i)->featid,(int)feats_slam.at(i)->timestamps_left.size());
     } else {
-      feats_slam_DELAYED.push_back(feats_slam.at(i));
+      feats_slam_DELAYED.push_back(feats_slam.at(i)); // 还没进状态的新特征，需要先三角化初始化
       // PRINT_DEBUG("[UPDATE-SLAM]: new feature ready %d (%d
       // measurements)\n",(int)feats_slam.at(i)->featid,(int)feats_slam.at(i)->timestamps_left.size());
     }
   }
 
   // Concatenate our MSCKF feature arrays (i.e., ones not being used for slam updates)
+  // 把本帧"不走 SLAM 更新、只走 MSCKF 更新"的三类特征，合并成一个统一列表 featsup_MSCKF，交给 MSCKF 更新器处理
+  // feats_lost: 在当前最新帧丢失的特征（最新帧没有新观测），它的轨迹已经结束，正好把积累的观测一次性用于 MSCKF 更新，然后清理掉
+  // feats_marg: 包含最老克隆时刻的特征（即将被边缘化的时刻还有观测）,最老克隆马上要被边缘化，这些特征的观测必须在这之前用掉，否则信息丢失
+  // feats_maxtracks:	达到最大轨迹长度、但没有被提升为 SLAM 的特征, 轨迹已到上限，不会再变长，适合做完最后一次 MSCKF 更新后释放
+  // 三者共同点：都不再作为 SLAM 路标长期留在状态里，所以它们都以"用完即弃"的方式走 MSCKF 更新
+  // 用于 SLAM 更新的特征（feats_slam，也就是那些被提升/已存在的 SLAM 路标）不在这里。它们已经在上一步被分流到 feats_slam_UPDATE / feats_slam_DELAYED
+  // 这就是 MSCKF + SLAM 混合架构的"分工"：
+  // - SLAM 特征：常驻状态，长期约束（慢变量、高价值）
+  // - MSCKF 特征：用完即弃，短期约束（大量普通特征）
+  // 同一个特征只会被分配到一边，绝不重复使用信息。
   std::vector<std::shared_ptr<Feature>> featsup_MSCKF = feats_lost;
   featsup_MSCKF.insert(featsup_MSCKF.end(), feats_marg.begin(), feats_marg.end());
   featsup_MSCKF.insert(featsup_MSCKF.end(), feats_maxtracks.begin(), feats_maxtracks.end());
@@ -543,35 +612,48 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
       bsize += pair.second.size();
     return asize < bsize;
   };
+  // 按轨迹长度升序排序（短轨迹在前，长轨迹在后）
   std::sort(featsup_MSCKF.begin(), featsup_MSCKF.end(), compare_feat);
 
   // Pass them to our MSCKF updater
+  // MSCKF 更新（截断 + 执行）
   // NOTE: if we have more then the max, we select the "best" ones (i.e. max tracks) for this update
   // NOTE: this should only really be used if you want to track a lot of features, or have limited computational resources
+  // 超过 max_msckf_in_update 时，保留末尾（轨迹最长）的 N 个
   if ((int)featsup_MSCKF.size() > state->_options.max_msckf_in_update)
     featsup_MSCKF.erase(featsup_MSCKF.begin(), featsup_MSCKF.end() - state->_options.max_msckf_in_update);
   updaterMSCKF->update(state, featsup_MSCKF);
-  propagator->invalidate_cache();
+  propagator->invalidate_cache(); // 更新改了状态（位姿、bias 等），之前传播用的缓存不再有效，必须失效，否则下次传播会用旧状态
   rT4 = boost::posix_time::microsec_clock::local_time();
 
   // Perform SLAM delay init and update
+  // SLAM 更新（分批顺序更新）
   // NOTE: that we provide the option here to do a *sequential* update
   // NOTE: this will be a lot faster but won't be as accurate.
-  std::vector<std::shared_ptr<Feature>> feats_slam_UPDATE_TEMP;
+  // 为什么分批？ 
+  // 每个 SLAM 路标都在状态向量里，更新时雅可比涉及整个状态，max_slam_in_update 限制了单次更新的路标数，避免一次构造过大的信息矩阵（内存/计算爆炸）。
+  // 用 while 循环分批处理，直到全部更新完。
+  // 注意：每批更新后都 invalidate_cache，因为每批都会改状态，下一批的雅可比必须基于最新状态。
+  // 注释里提到"sequential update"选项——如果开启，只更新一部分、速度更快但精度略低。
+  std::vector<std::shared_ptr<Feature>> feats_slam_UPDATE_TEMP; // 记录已经更新的slam特征点
   while (!feats_slam_UPDATE.empty()) {
     // Get sub vector of the features we will update with
+    // 每次取最多 max_slam_in_update 个
     std::vector<std::shared_ptr<Feature>> featsup_TEMP;
     featsup_TEMP.insert(featsup_TEMP.begin(), feats_slam_UPDATE.begin(),
                         feats_slam_UPDATE.begin() + std::min(state->_options.max_slam_in_update, (int)feats_slam_UPDATE.size()));
-    feats_slam_UPDATE.erase(feats_slam_UPDATE.begin(),
+    feats_slam_UPDATE.erase(feats_slam_UPDATE.begin(), // 取完之后从待更新列表里删掉这批
                             feats_slam_UPDATE.begin() + std::min(state->_options.max_slam_in_update, (int)feats_slam_UPDATE.size()));
     // Do the update
-    updaterSLAM->update(state, featsup_TEMP);
-    feats_slam_UPDATE_TEMP.insert(feats_slam_UPDATE_TEMP.end(), featsup_TEMP.begin(), featsup_TEMP.end());
-    propagator->invalidate_cache();
+    updaterSLAM->update(state, featsup_TEMP);  // 用这一批更新
+    feats_slam_UPDATE_TEMP.insert(feats_slam_UPDATE_TEMP.end(), featsup_TEMP.begin(), featsup_TEMP.end()); // 记录已更新的
+    propagator->invalidate_cache(); // 每次更新后缓存失效
   }
   feats_slam_UPDATE = feats_slam_UPDATE_TEMP;
   rT5 = boost::posix_time::microsec_clock::local_time();
+  // SLAM 延迟初始化
+  // 对"还没进EKF状态"的新路标做三角化初始化：用积累的多帧观测三角化出 3D 位置，选择表示方式（全局/锚点逆深度等），加入 state->_features_SLAM。
+  // 失败的路标（三角化质量差）会在这里被剔除。
   updaterSLAM->delayed_init(state, feats_slam_DELAYED);
   rT6 = boost::posix_time::microsec_clock::local_time();
 
@@ -580,21 +662,24 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   //===================================================================================
 
   // Re-triangulate all current tracks in the current frame
+  // 只在基相机(cam0)帧时重三角化当前活跃轨迹，用于可视化
   if (message.sensor_ids.at(0) == 0) {
 
     // Re-triangulate features
+    // 用当前所有克隆重三角化还在跟踪的特征，得到更准的 3D 位置供可视化（只在 cam0 帧做，避免重复）
     retriangulate_active_tracks(message);
 
     // Clear the MSCKF features only on the base camera
     // Thus we should be able to visualize the other unique camera stream
     // MSCKF features as they will also be appended to the vector
-    good_features_MSCKF.clear();
+    good_features_MSCKF.clear(); // 只清基相机流的可视化特征
   }
 
   // Save all the MSCKF features used in the update
+  // 保存本次 MSCKF 更新用到的特征 3D 位置（供可视化）
   for (auto const &feat : featsup_MSCKF) {
     good_features_MSCKF.push_back(feat->p_FinG);
-    feat->to_delete = true;
+    feat->to_delete = true; // 关键一步——标记这些 MSCKF 特征"本次已用过"。之后的 database->cleanup() 会真正删除它们，保证信息不重复使用（与前面 skip_deleted 的逻辑呼应）
   }
 
   //===================================================================================

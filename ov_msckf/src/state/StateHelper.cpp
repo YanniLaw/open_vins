@@ -741,12 +741,18 @@ void StateHelper::marginalize_old_clone(std::shared_ptr<State> state) {
   }
 }
 
+/**
+ * @brief 边缘化标记为 should_marg 的 普通SLAM 路标
+ *
+ * @param state 当前滤波器状态
+ */
 void StateHelper::marginalize_slam(std::shared_ptr<State> state) {
   // Remove SLAM features that have their marginalization flag set
   // We also check that we do not remove any aruoctag landmarks
   int ct_marginalized = 0;
   auto it0 = state->_features_SLAM.begin();
   while (it0 != state->_features_SLAM.end()) {
+    // (*it0).first 是特征的 ID，这里只边缘化普通SLAM特征(aruco受到保护)
     if ((*it0).second->should_marg && (int)(*it0).first > 4 * state->_options.max_aruco_features) {
       StateHelper::marginalize(state, (*it0).second);
       it0 = state->_features_SLAM.erase(it0);

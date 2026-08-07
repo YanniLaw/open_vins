@@ -152,6 +152,9 @@ public:
   std::map<double, std::shared_ptr<ov_type::PoseJPL>> _clones_IMU;
 
   /// Our current set of SLAM features (3d positions)
+  /// 当前EKF状态中所有的SLAM路标，包含aruco和非aruco特征(普通特征)，key是特征ID，value是特征对象
+  /// 这些SLAM路标是持久化的，状态中会一直保留，直到被边缘化或删除
+  /// 这些SLAM路标的状态是全局的，包含在状态向量中，协方差矩阵中也有
   std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> _features_SLAM;
 
   /// Time offset base IMU to camera (t_imu = t_cam + t_off)

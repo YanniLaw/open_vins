@@ -58,10 +58,10 @@ public:
   std::unordered_map<size_t, std::vector<double>> timestamps;
 
   /// What camera ID our pose is anchored in!! By default the first measurement is the anchor.
-  /// 该特征点的锚定相机ID，默认第一个观测为锚点
+  /// 该特征点的锚定相机ID，默认为第一个观测相机
   int anchor_cam_id = -1;
 
-  /// Timestamp of anchor clone 锚点的时间戳
+  /// Timestamp of anchor clone 锚点帧(参考帧)的时间戳
   double anchor_clone_timestamp;
 
   /// Triangulated position of this feature, in the anchor frame

@@ -71,10 +71,10 @@ protected:
   /// Options used during update
   UpdaterOptions _options;
 
-  /// Feature initializer class object
+  /// Feature initializer class object 特征三角化器
   std::shared_ptr<ov_core::FeatureInitializer> initializer_feat;
 
-  /// Chi squared 95th percentile table (lookup would be size of residual)
+  /// Chi squared 95th percentile table (lookup would be size of residual) 卡方检验阈值表
   std::map<int, double> chi_squared_table;
 };
 

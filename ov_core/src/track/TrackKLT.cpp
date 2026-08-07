@@ -607,7 +607,7 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
     // append the new uv coordinate 添加亚像素坐标
     pts0.push_back(kpts0_new.at(i));
     // move id foward and append this new point
-    size_t temp = ++currid;
+    size_t temp = ++currid; // 注意这个ID 在构造函数中给aruco预留了ID位置，currid = 4 * (size_t)numaruco + 1; 
     ids0.push_back(temp);
   }
 }

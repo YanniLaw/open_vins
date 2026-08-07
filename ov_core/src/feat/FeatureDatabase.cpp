@@ -26,6 +26,13 @@
 
 using namespace ov_core;
 
+/**
+ * @brief 从特征数据库中获取指定ID的特征
+ * 
+ * @param id Feature ID
+ * @param remove 是否从数据库中移除该特征(默认false)
+ * @return std::shared_ptr<Feature> The feature with the given ID, or nullptr if not found
+ */
 std::shared_ptr<Feature> FeatureDatabase::get_feature(size_t id, bool remove) {
   std::lock_guard<std::mutex> lck(mtx);
   if (features_idlookup.find(id) != features_idlookup.end()) {
@@ -38,6 +45,14 @@ std::shared_ptr<Feature> FeatureDatabase::get_feature(size_t id, bool remove) {
   }
 }
 
+/**
+ * @brief 从特征数据库中获取指定ID的特征的克隆副本
+ * 
+ * @param id Feature ID
+ * @param feat 获取的特征的克隆副本，将被填充
+ * @return true If the feature was found and cloned successfully
+ * @return false If the feature with the given ID was not found
+ */
 bool FeatureDatabase::get_feature_clone(size_t id, Feature &feat) {
   std::lock_guard<std::mutex> lck(mtx);
   if (features_idlookup.find(id) == features_idlookup.end())
@@ -197,6 +212,14 @@ std::vector<std::shared_ptr<Feature>> FeatureDatabase::features_containing_older
   return feats_old;
 }
 
+/**
+ * @brief 获取包含指定时间戳的特征
+ * 
+ * @param timestamp 指定的时间戳
+ * @param remove 是否从数据库中移除这些特征
+ * @param skip_deleted 是否跳过已标记删除的特征
+ * @return std::vector<std::shared_ptr<Feature>> 包含指定时间戳的特征列表
+ */
 std::vector<std::shared_ptr<Feature>> FeatureDatabase::features_containing(double timestamp, bool remove, bool skip_deleted) {
 
   // Our vector of old features
@@ -205,7 +228,7 @@ std::vector<std::shared_ptr<Feature>> FeatureDatabase::features_containing(doubl
   // Now lets loop through all features, and just make sure they are not
   std::lock_guard<std::mutex> lck(mtx);
   for (auto it = features_idlookup.begin(); it != features_idlookup.end();) {
-    // Skip if already deleted
+    // Skip if already deleted 跳过已标记删除的特征
     if (skip_deleted && (*it).second->to_delete) {
       it++;
       continue;
