@@ -53,15 +53,16 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
   int total_meas = 0;   // 该特征点在不同相机上的总观测数
   size_t anchor_most_meas = 0;
   size_t most_meas = 0; // 该特征点在单个相机上的最大观测数
+  // std::unordered_map<size_t, std::vector<double>> timestamps; // 该特征点在每个相机上的观测时间戳列表
   for (auto const &pair : feat->timestamps) {
-    total_meas += (int)pair.second.size();
+    total_meas += (int)pair.second.size(); // 统计该特征点在所有相机上的总观测数
     if (pair.second.size() > most_meas) {
       anchor_most_meas = pair.first;
       most_meas = pair.second.size();
     }
   }
   feat->anchor_cam_id = anchor_most_meas; // 选择观测数最多的相机作为锚点相机
-  feat->anchor_clone_timestamp = feat->timestamps.at(feat->anchor_cam_id).back(); // 该相机最后一帧
+  feat->anchor_clone_timestamp = feat->timestamps.at(feat->anchor_cam_id).back(); // 以锚点相机最后一帧观测作为锚点时间戳
 
   // Our linear system matrices
   /**
@@ -83,15 +84,22 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
 
   // Get the position of the anchor pose
   // 锚点 = 观测最多的相机 的最后一张图。三角化结果 p_FinA 以锚点相机位姿为参考系表示
+  // 为什么代码特意选锚点系而不是世界系?
+  // 1. 数值稳定性：锚点系以相机位姿为原点，坐标量级小、靠近原点；而世界系坐标可能很大（尤其经过长时间积分），直接求解 
+  // APf = b 会引入较大的数值误差。这正是代码里把 p_CiinG 做 R_GtoA * (p_CiinG - p_AinG) 平移的目的。
+  // 2. 后续精化本来就要锚点系结果：single_gaussnewton 用的是锚点系下的逆深度参数化 (α,β,ρ)，它直接从 feat->p_FinA 取初值,
+  // double rho = 1 / feat->p_FinA(2); 所以线性三角化直接输出锚点系结果，省去一次坐标变换
+  // 3. 需要世界系时最后再转回，也就是函数结尾
   ClonePose anchorclone = clonesCAM.at(feat->anchor_cam_id).at(feat->anchor_clone_timestamp);
   const Eigen::Matrix<double, 3, 3> &R_GtoA = anchorclone.Rot();
   const Eigen::Matrix<double, 3, 1> &p_AinG = anchorclone.pos();
 
   // Loop through each camera for this feature 遍历所有测量，累加线性系统
-  for (auto const &pair : feat->timestamps) {
+  // std::unordered_map<size_t, std::vector<double>> timestamps
+  for (auto const &pair : feat->timestamps) { // 遍历所有相机的观测时间戳列表，pair.first = 相机索引，pair.second = 该相机的观测时间戳列表
 
     // Add CAM_I features
-    for (size_t m = 0; m < feat->timestamps.at(pair.first).size(); m++) {
+    for (size_t m = 0; m < feat->timestamps.at(pair.first).size(); m++) { // 遍历该相机的每个观测时间戳
 
       // Get the position of this clone in the global 该测量时刻的相机位姿
       const Eigen::Matrix<double, 3, 3> &R_GtoCi = clonesCAM.at(pair.first).at(feat->timestamps.at(pair.first).at(m)).Rot();
@@ -120,6 +128,7 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
   }
 
   // Solve the linear system 带列主元的 QR 分解求解线性系统 APf=b， 数值稳定性较好
+  // 这里的 p_f 是锚点系下的特征点位置，因为在前面的循环中，所有的观测都被转换到了锚点坐标系下!!!
   Eigen::MatrixXd p_f = A.colPivHouseholderQr().solve(b);
 
   // Check A and p_f
@@ -135,8 +144,11 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
 
   // If we have a bad condition number, or it is too close
   // Then set the flag for bad (i.e. set z-axis to nan)
-  // 条件数检验是关键：如果各相机视线近乎平行（相机几乎没有位移基线），A 接近奇异，条件数巨大——此时三角化结果不可信，
+  // 质量检测: 
+  // 1. 条件数检验是关键：如果各相机视线近乎平行（相机几乎没有位移基线），A 接近奇异，条件数巨大——此时三角化结果不可信，
   // 必须返回 false（在 UpdaterMSCKF::update 里该特征会被剔除）
+  // 2. 距离范围检验: z 坐标超出 [min_dist, max_dist]（特征太近或太远）也判为失败
+  // 3. NaN 检验: 如果三角化结果为 NaN，也判为失败
   if (std::abs(condA) > _options.max_cond_number || p_f(2, 0) < _options.min_dist || p_f(2, 0) > _options.max_dist ||
       std::isnan(p_f.norm())) {
     return false;
@@ -236,6 +248,9 @@ bool FeatureInitializer::single_triangulation_1d(std::shared_ptr<Feature> feat,
  * 用 LM 算法在逆深度参数化下最小化所有视角的重投影残差，对 single_triangulation 给的线性初值做非线性精化：
  * 通过 λ 自适应调节在高斯牛顿（快）与梯度下降（稳）之间切换，迭代收敛后把结果转回欧氏坐标，并用"切平面有效基线比"检验退化，
  * 最终输出精化后的 p_FinA/p_FinG——这就是 MSCKF 特征三角化的"线性初值 + 非线性精化"两步法。
+ * 为什么需要它?
+ * 线性三角化（DLT）只是最小二乘闭式解，对噪声敏感、也不是最小化重投影误差意义上的最优，还可能会产生退化情况（例如相机视线接近共线）。
+ * single_gaussnewton 把问题变成非线性最小二乘，用迭代优化精化初值，提高精度以及鲁棒性。
  * @param feat 
  * @param clonesCAM 
  * @return true 
@@ -245,7 +260,7 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
                                             std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM) {
 
   // Get into inverse depth
-  // 把3D坐标换成锚点系下的逆深度表示(α, β, ρ),好处: 
+  // 把锚点系下的3D坐标换成锚点系下的逆深度表示(α, β, ρ),好处: 
   // 1. 特征位置 = 1/ρ * [α, β, 1]^T,参数化更稳定;
   // 2. 逆深度对近/远特征尺度更友好，数值条件更好。
   double rho = 1 / feat->p_FinA(2); // 逆深度参数化：ρ = 1/z，z = feat->p_FinA(2) 是锚点系下的深度
@@ -266,7 +281,7 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
   // Cost at the last iteration
   double cost_old = compute_error(clonesCAM, feat, alpha, beta, rho);
 
-  // Get the position of the anchor pose
+  // Get the position of the anchor pose 锚点坐标系位姿
   const Eigen::Matrix<double, 3, 3> &R_GtoA = clonesCAM.at(feat->anchor_cam_id).at(feat->anchor_clone_timestamp).Rot();
   const Eigen::Matrix<double, 3, 1> &p_AinG = clonesCAM.at(feat->anchor_cam_id).at(feat->anchor_clone_timestamp).pos();
 
@@ -338,9 +353,12 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
     }
 
     // Solve Levenberg iteration
+    // λ 大 → 接近梯度下降（稳、慢）；
+    // λ 小 → 接近高斯牛顿（快、但可能发散）
+    // 代码通过代价是否下降来自适应调节
     Eigen::Matrix<double, 3, 3> Hess_l = Hess;
     for (size_t r = 0; r < (size_t)Hess.rows(); r++) {
-      Hess_l(r, r) *= (1.0 + lam);
+      Hess_l(r, r) *= (1.0 + lam); // 阻尼处理，对角线放大(1+λ)，这是 LM 与纯高斯牛顿的区别
     }
 
     Eigen::Matrix<double, 3, 1> dx = Hess_l.colPivHouseholderQr().solve(grad);
@@ -354,7 +372,7 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
     // ss << "run = " << runs << " | cost = " << dx.norm() << " | lamda = " << lam << " | depth = " << 1/rho << endl;
     // PRINT_DEBUG(ss.str().c_str());
 
-    // Check if converged
+    // Check if converged 收敛判断(提前退出)
     if (cost <= cost_old && (cost_old - cost) / cost_old < _options.min_dcost) {
       alpha += dx(0, 0);
       beta += dx(1, 0);
@@ -365,6 +383,8 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
 
     // If cost is lowered, accept step
     // Else inflate lambda (try to make more stable)
+    // 代价下降 → 接受步长，λ 减小，下一步更接近高斯牛顿；
+    // 代价上升 → 拒绝步长，λ 增大，下一步更接近梯度下降
     if (cost <= cost_old) {
       recompute = true;
       cost_old = cost;
@@ -381,6 +401,7 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
     }
   }
 
+  // 质量检验
   // Revert to standard, and set to all  逆深度 → 欧氏坐标
   feat->p_FinA(0) = alpha / rho;
   feat->p_FinA(1) = beta / rho;
@@ -427,13 +448,23 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
   return true;
 }
 
+/**
+ * @brief Compute the error for a given feature and its associated camera poses.
+ * 
+ * @param clonesCAM 
+ * @param feat 
+ * @param alpha 
+ * @param beta 
+ * @param rho 
+ * @return double 
+ */
 double FeatureInitializer::compute_error(std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM,
                                          std::shared_ptr<Feature> feat, double alpha, double beta, double rho) {
 
   // Total error
   double err = 0;
 
-  // Get the position of the anchor pose
+  // Get the position of the anchor pose 锚点坐标系位姿
   const Eigen::Matrix<double, 3, 3> &R_GtoA = clonesCAM.at(feat->anchor_cam_id).at(feat->anchor_clone_timestamp).Rot();
   const Eigen::Matrix<double, 3, 1> &p_AinG = clonesCAM.at(feat->anchor_cam_id).at(feat->anchor_clone_timestamp).pos();
 
@@ -465,7 +496,7 @@ double FeatureInitializer::compute_error(std::unordered_map<size_t, std::unorder
       double hi3 = R_AtoCi(2, 0) * alpha + R_AtoCi(2, 1) * beta + R_AtoCi(2, 2) + rho * p_AinCi(2, 0);
       // Calculate residual
       Eigen::Matrix<float, 2, 1> z;
-      z << hi1 / hi3, hi2 / hi3;
+      z << hi1 / hi3, hi2 / hi3; // 预测的归一化坐标（透视投影）
       Eigen::Matrix<float, 2, 1> res = feat->uvs_norm.at(pair.first).at(m) - z;
       // Append to our summation variables
       err += pow(res.norm(), 2);
