@@ -189,32 +189,47 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
   assert(false);
 }
 
+/**
+ * @brief Compute the full Jacobian for a given feature with respect to the feature itself and the involved states.
+ * 为单个特征构造完整线性化测量模型。把一个特征在所有相机、所有时刻的观测堆叠起来，
+ * 输出残差 r、特征雅可比Hf、状态雅可比Hx以及涉及的状态列表。目标是把下面这个线性化方程建立出来：
+ *  r = H_f * delta_f + H_x * delta_x
+ * 
+ * @param state 
+ * @param feature 
+ * @param H_f 
+ * @param H_x 
+ * @param res 
+ * @param x_order 
+ */
 void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, UpdaterHelperFeature &feature, Eigen::MatrixXd &H_f,
                                               Eigen::MatrixXd &H_x, Eigen::VectorXd &res, std::vector<std::shared_ptr<Type>> &x_order) {
 
   // Total number of measurements for this feature
+  // 统计该特征的总观测次数（所有相机、所有时刻）
   int total_meas = 0;
   for (auto const &pair : feature.timestamps) {
     total_meas += (int)pair.second.size();
   }
 
   // Compute the size of the states involved with this feature
-  int total_hx = 0;
-  std::unordered_map<std::shared_ptr<Type>, size_t> map_hx;
+  int total_hx = 0; // 所有涉及状态的总维数
+  std::unordered_map<std::shared_ptr<Type>, size_t> map_hx; // 状态对象 → 列偏移(在H_x中的起始列索引)
+  // 遍历观测到该特征的所有相机，统计涉及的状态维度并建立映射
   for (auto const &pair : feature.timestamps) {
 
     // Our extrinsics and intrinsics
     std::shared_ptr<PoseJPL> calibration = state->_calib_IMUtoCAM.at(pair.first);
     std::shared_ptr<Vec> distortion = state->_cam_intrinsics.at(pair.first);
 
-    // If doing calibration extrinsics
+    // If doing calibration extrinsics 相机外参
     if (state->_options.do_calib_camera_pose) {
       map_hx.insert({calibration, total_hx});
       x_order.push_back(calibration);
       total_hx += calibration->size();
     }
 
-    // If doing calibration intrinsics
+    // If doing calibration intrinsics 相机内参以及畸变
     if (state->_options.do_calib_camera_intrinsics) {
       map_hx.insert({distortion, total_hx});
       x_order.push_back(distortion);
@@ -222,11 +237,12 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
     }
 
     // Loop through all measurements for this specific camera
+    // 遍历该相机的所有观测
     for (size_t m = 0; m < feature.timestamps[pair.first].size(); m++) {
 
       // Add this clone if it is not added already
       std::shared_ptr<PoseJPL> clone_Ci = state->_clones_IMU.at(feature.timestamps[pair.first].at(m));
-      if (map_hx.find(clone_Ci) == map_hx.end()) {
+      if (map_hx.find(clone_Ci) == map_hx.end()) { // 因为有可能多个相机的观测对应同一个IMU克隆，确保每个克隆只被添加一次
         map_hx.insert({clone_Ci, total_hx});
         x_order.push_back(clone_Ci);
         total_hx += clone_Ci->size();
@@ -235,6 +251,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
   }
 
   // If we are using an anchored representation, make sure that the anchor is also added
+  // 如果特征是锚点表示，还要额外登记锚点克隆位姿及其外参（保证锚点状态也在雅可比里被考虑到）
   if (LandmarkRepresentation::is_relative_representation(feature.feat_representation)) {
 
     // Assert we have a clone
@@ -265,6 +282,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
 
   // Calculate the position of this feature in the global frame
   // If anchored, then we need to calculate the position of the feature in the global
+  // 把特征位置统一到全局系
   Eigen::Vector3d p_FinG = feature.p_FinG;
   if (LandmarkRepresentation::is_relative_representation(feature.feat_representation)) {
     // Assert that we have an anchor pose for this feature
@@ -290,11 +308,13 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
   //=========================================================================
 
   // Allocate our residual and Jacobians
+  // 分配残差向量和雅可比矩阵的内存
   int c = 0;
+  // 根据特征的表示类型决定雅可比矩阵的列数，如果是锚点逆深度表示，则列数为1，否则为3
   int jacobsize = (feature.feat_representation != LandmarkRepresentation::Representation::ANCHORED_INVERSE_DEPTH_SINGLE) ? 3 : 1;
-  res = Eigen::VectorXd::Zero(2 * total_meas);
-  H_f = Eigen::MatrixXd::Zero(2 * total_meas, jacobsize);
-  H_x = Eigen::MatrixXd::Zero(2 * total_meas, total_hx);
+  res = Eigen::VectorXd::Zero(2 * total_meas);  // 残差向量，每个观测有两个分量 (u, v)，所以长度是 2 * total_meas
+  H_f = Eigen::MatrixXd::Zero(2 * total_meas, jacobsize);   // 观测对特征的雅可比
+  H_x = Eigen::MatrixXd::Zero(2 * total_meas, total_hx);    // 观测对状态的雅可比
 
   // Derivative of p_FinG in respect to feature representation.
   // This only needs to be computed once and thus we pull it out of the loop

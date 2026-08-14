@@ -321,9 +321,42 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
 
           //=====================================================================================
           //=====================================================================================
-
+          /*
+          计算预测的归一化坐标 z=[hi1/hi3, hi2/hi3] 关于θ=(α, β, ρ) 的偏导数
+          这里其实是用的链式求导法则: z(θ) = z(h(θ))，先对内层 hi1, hi2, hi3 求导，再对外层θ 求导，最后相乘。
+          1) 内层求导: hi1, hi2, hi3 关于 (α, β, ρ) 的偏导数
+          内层求导: hi1, hi2, hi3 关于 (α, β, ρ) 的偏导数
+          已知h的表达式)
+          h1 = R00* α + R01* β + R02 + ρ * p0
+          h2 = R10* α + R11* β + R12 + ρ * p1
+          h3 = R20* α + R21* β + R22 + ρ * p2
+          h是参数α, β, ρ 的线性函数，所以偏导数就是系数本身: 
+          ∂h1/∂α = R00, ∂h1/∂β = R01, ∂h1/∂ρ = p0
+          ∂h2/∂α = R10, ∂h2/∂β = R11, ∂h2/∂ρ = p1
+          ∂h3/∂α = R20, ∂h3/∂β = R21, ∂h3/∂ρ = p2
+          写成矩阵就是
+          [ R00  R01  p0 ]
+          [ R10  R11  p1 ] = ∂h / ∂θ
+          [ R20  R21  p2 ] 
+          2) 外层求导: z 关于 hi1, hi2, hi3 的偏导数
+          外层(透视投影) z1 = hi1 / hi3, z2 = hi2 / hi3
+          对外层求雅可比，我们需要用到商法则，即 (u/v)' = (u'v - uv') / v^2
+          对z1 = h1 / h3, 有 ∂z1/∂h1 = 1/h3, ∂z1/∂h2 = 0, ∂z1/∂h3 = -h1/(h3^2)
+          对z2 = h2 / h3, 有 ∂z2/∂h1 = 0, ∂z2/∂h2 = 1/h3, ∂z2/∂h3 = -h2/(h3^2)
+          写成矩阵就是
+          [ 1/ h3  0    -h1/(h3^2) ] = ∂z / ∂h
+          [ 0     1/h3  -h2/(h3^2) ]
+          3) 链式求导: ∂z/∂θ = ∂z/∂h * ∂h/∂θ (两个矩阵相乘即可)
+          ∂z1/∂α = 1/ h3 * R00 + (-h1/(h3^2)) * R20
+          ∂z1/∂β = 1/ h3 * R01 + (-h1/(h3^2)) * R21
+          ∂z1/∂ρ = 1/ h3 * p0 + (-h1/(h3^2)) * p2
+          ∂z2/∂α = 1/ h3 * R10 + (-h2/(h3^2)) * R20
+          ∂z2/∂β = 1/ h3 * R11 + (-h2/(h3^2)) * R21
+          ∂z2/∂ρ = 1/ h3 * p1 + (-h2/(h3^2)) * p2
+          */
           // Middle variables of the system
-          // 中间量：把 (α, β, ρ) 投影到相机 i 系
+          // 计算公式见 https://docs.openvins.com/update-featinit.html#featinit-nonlinear
+          // hi1, hi2, hi3 是特征点在相机 i 系下的齐次坐标(除以了锚点深度A_Zf)
           double hi1 = R_AtoCi(0, 0) * alpha + R_AtoCi(0, 1) * beta + R_AtoCi(0, 2) + rho * p_AinCi(0, 0);
           double hi2 = R_AtoCi(1, 0) * alpha + R_AtoCi(1, 1) * beta + R_AtoCi(1, 2) + rho * p_AinCi(1, 0);
           double hi3 = R_AtoCi(2, 0) * alpha + R_AtoCi(2, 1) * beta + R_AtoCi(2, 2) + rho * p_AinCi(2, 0);
@@ -334,7 +367,7 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
           double d_z2_d_alpha = (R_AtoCi(1, 0) * hi3 - hi2 * R_AtoCi(2, 0)) / (pow(hi3, 2));
           double d_z2_d_beta = (R_AtoCi(1, 1) * hi3 - hi2 * R_AtoCi(2, 1)) / (pow(hi3, 2));
           double d_z2_d_rho = (p_AinCi(1, 0) * hi3 - hi2 * p_AinCi(2, 0)) / (pow(hi3, 2));
-          Eigen::Matrix<double, 2, 3> H;
+          Eigen::Matrix<double, 2, 3> H; // 其实是残差对变量的雅可比矩阵 (Jacobian)
           H << d_z1_d_alpha, d_z1_d_beta, d_z1_d_rho, d_z2_d_alpha, d_z2_d_beta, d_z2_d_rho;
           // Calculate residual
           Eigen::Matrix<float, 2, 1> z;
@@ -346,8 +379,26 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
 
           // Append to our summation variables
           err += std::pow(res.norm(), 2); // 代价
-          grad.noalias() += H.transpose() * res.cast<double>(); // 梯度
-          Hess.noalias() += H.transpose() * H; // 信息矩阵(高斯牛顿近似海森矩阵)
+          grad.noalias() += H.transpose() * res.cast<double>(); // J^T * r
+          Hess.noalias() += H.transpose() * H; // J^T * J  高斯牛顿近似海森矩阵
+          // 用 J^T * J 近似海森矩阵，本质上是牺牲掉残差带来的二阶曲率信息，换取绝对的正定性保证和一阶导数的廉价计算。
+          /* 为什么可以用J^T * J 近似海森矩阵？
+          假设目标函数是残差的平方和 F(x) = 1/2 * r(x)^T * r(x)
+          其中 r(x) 是残差向量，J = ∂r/∂x 是雅可比矩阵
+          则梯度 ∇F(x) = J^T * r(x)
+          海森矩阵 H = ∇^2 F(x) = J^T * J + Σ ri * ∇^2 ri
+          当残差较小时，第二项可以忽略，因此 H ≈ J^T * J
+          用 J^T * J 近似海森矩阵有什么好处??？
+          1. 正定性: 真实海森矩阵H可能不是正定的(比如鞍点或者非凸区域)，而 J^T * J 总是半正定的，加上阻尼项就是正定，保证永远是下降方向;
+          2. 计算代价: 计算海森矩阵H需要计算复杂的二阶偏导, 而 J^T * J 只需一阶导数，比求二阶导快得多，且极度适合并行计算；
+          3. 存储代价: 海森矩阵H需要存储二阶张量（3维数据），内存爆炸，而 J^T * J 只需存储一阶导数(二维矩阵)，节省大量内存。
+          
+          note: 当残差r很大时，扔掉第二项会导致近似误差极大，算法收敛及慢甚至发散。
+          补救措施 --Levenberg-Marquardt 算法，LM算法
+          在J^T * J 的基础上加入阻尼项，即 H ≈ J^T * J + λI，可以在残差较大时提高算法的稳定性，这就是 LM 算法的核心思想。
+          当λ很大时，退化为梯度下降(稳健但慢，适合远离最优解时); 
+          当λ很小时，接近高斯牛顿J^T * J (快，但可能发散，依赖初始值，适合接近最优解时);
+          */
         }
       }
     }
@@ -358,9 +409,16 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
     // 代码通过代价是否下降来自适应调节
     Eigen::Matrix<double, 3, 3> Hess_l = Hess;
     for (size_t r = 0; r < (size_t)Hess.rows(); r++) {
+      // 注意，这里不是教科书上常见的J^T * J+λI 的形式，而是Marquardt 原始论文里的变体——"按对角线缩放"(被注释掉的那行才是标准λI版本)
+      // 为什么用 λ·diag(H) 而不是 λI？
+      // 因为参数 𝛼,𝛽, ρ的量纲和数值量级差异巨大: 𝛼,𝛽是归一化坐标（量级 ~1),而 ρ是逆深度（量级可能是 0.01~10）。
+      // 用 λI 时，同样的阻尼强度对 ρ 和 𝛼 效果完全不同；
+      // 而 λdiag(H) 会按每个参数自身曲率（H_ii 反映了该方向的信息量）自适应地加阻尼——曲率大的方向阻尼大，天然对参数缩放不变（scale-invariant），数值上更稳健。
       Hess_l(r, r) *= (1.0 + lam); // 阻尼处理，对角线放大(1+λ)，这是 LM 与纯高斯牛顿的区别
     }
-
+    // 解线性方程组求步长 dx，阻尼后Hess_l严格正定，解出的dx一定是下降方向
+    // colPivHouseholderQr是带列主元的 QR 分解求解器：数值稳定性好，不需要矩阵正定前提，对 3×3 小矩阵开销可忽略。
+    // 相比直接求逆或 Cholesky（LLT/LDLT），QR 对病态/接近奇异的 海森矩阵H 更鲁棒
     Eigen::Matrix<double, 3, 1> dx = Hess_l.colPivHouseholderQr().solve(grad);
     // Eigen::Matrix<double,3,1> dx = (Hess+lam*Eigen::MatrixXd::Identity(Hess.rows(), Hess.rows())).colPivHouseholderQr().solve(grad);
 
@@ -373,11 +431,12 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
     // PRINT_DEBUG(ss.str().c_str());
 
     // Check if converged 收敛判断(提前退出)
+    // 代价确实没有上升 且 相对代价下降率小于最小阈值(改进已经微不足道，说明接近最优解，继续迭代无意义)，认为收敛
     if (cost <= cost_old && (cost_old - cost) / cost_old < _options.min_dcost) {
-      alpha += dx(0, 0);
-      beta += dx(1, 0);
-      rho += dx(2, 0);
-      eps = 0;
+      alpha += dx(0, 0);  // 更新 alpha
+      beta += dx(1, 0);   // 更新 beta
+      rho += dx(2, 0);    // 更新 rho
+      eps = 0; // 让 while 条件 eps > min_dx 失效
       break;
     }
 
@@ -386,22 +445,27 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
     // 代价下降 → 接受步长，λ 减小，下一步更接近高斯牛顿；
     // 代价上升 → 拒绝步长，λ 增大，下一步更接近梯度下降
     if (cost <= cost_old) {
-      recompute = true;
+      recompute = true; // 角度θ 更新，需要重新计算雅可比和残差
       cost_old = cost;
       alpha += dx(0, 0);
       beta += dx(1, 0);
       rho += dx(2, 0);
       runs++;
-      lam = lam / _options.lam_mult;
-      eps = dx.norm();
+      lam = lam / _options.lam_mult; // 减小阻尼λ ，下一步更接近高斯牛顿
+      eps = dx.norm();  // 记录步长，供下次收敛/退出判断
     } else {
-      recompute = false;
-      lam = lam * _options.lam_mult;
-      continue;
+      // recompute = false（省计算的关键）
+      // 步长被拒绝意味着 θ 根本没变，既然 θ 没变，累加的Hessian和梯度仍然有效，无需重新计算,只是把λ放大后重新解一遍阻尼法方程再求dx
+      // λ 增大：步长走过头了，说明当前 λ 太激进，放大 λ 让系统更接近梯度下降（保守、稳），期望下一步更小更安全
+      // 注意：拒绝分支不更新 eps 也不 runs++。反复被拒绝时，λ 不断翻倍，最终会触发 while 条件 lam < max_lamda 失效而退出——这是"优化失败"的退出路径。
+      recompute = false; // θ 没变，雅可比仍然有效！
+      lam = lam * _options.lam_mult; // λ 增大 → 更接近梯度下降
+      continue; // 回到循环顶部，但不重算雅可比
     }
   }
 
   // 质量检验
+  // LM 全程在逆深度参数化下优化，迭代结束得到 (α,β,ρ)，按定义还原回锚点系 3D 坐标
   // Revert to standard, and set to all  逆深度 → 欧氏坐标
   feat->p_FinA(0) = alpha / rho;
   feat->p_FinA(1) = beta / rho;
@@ -409,9 +473,14 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
 
   // Get tangent plane to x_hat
   // 做基线比（baseline ratio）检验——这是这里特有的退化检测
+  // QR分解 p = QR,其中 Q (3*3)是正交矩阵，R 是上三角矩阵，Q 的第一列就是 p 的归一化方向；Q 的后两列张成与 p 垂直的二维平面
+  // 对3x1向量A_Pf 进行QR分解，对一个向量v来说，QR得到的正交矩阵Q满足: 
+  // Q^T v = [||v||, 0, 0]^T, 
+  // 也就是说，Q的第0列 ∝v（沿视线方向），第1，第2列张成与v垂直的平面----这个平面就是过锚点，垂直于观测视线的切平面
   Eigen::HouseholderQR<Eigen::MatrixXd> qr(feat->p_FinA);
   Eigen::MatrixXd Q = qr.householderQ();
-
+  // 为什么要投影到切平面？
+  // 因为三角化估计深度靠的是视差（parallax），而只有垂直于视线方向的基线分量才产生视差
   // Max baseline we have between poses
   double base_line_max = 0.0;
 
@@ -424,9 +493,13 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
       const Eigen::Matrix<double, 3, 1> &p_CiinG = clonesCAM.at(pair.first).at(feat->timestamps.at(pair.first).at(m)).pos();
       // Convert current position relative to anchor
       Eigen::Matrix<double, 3, 1> p_CiinA = R_GtoA * (p_CiinG - p_AinG);
-      // Dot product camera pose and nullspace
+      // Dot product camera pose and nullspace 取第1.2列 Q.block(0, 1, 3, 2)，即Q_⊥，其列张成与视线方向垂直的切平面
+      // 把相机位置投影到切平面上，norm 就是"有效基线"
+      // beff=||Q_⊥^T * A_P_Ci|| ， Q_⊥^T * A_P_Ci是相机位姿在切平面上的2D投影
+      // 它的模长 = 相机 Ci相对锚点的有效基线（垂直于视线那部分）
+      // 若所有相机都几乎沿视线方向排列（基线平行于视线），beff≈0 → 无视差 → 深度不可观测
       double base_line = ((Q.block(0, 1, 3, 2)).transpose() * p_CiinA).norm();
-      if (base_line > base_line_max)
+      if (base_line > base_line_max) // 切平面投影 → 有效基线，取所有观测中的最大值,它衡量"这次三角化能提供多少视差信息"
         base_line_max = base_line;
     }
   }
@@ -437,7 +510,16 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
   // Check if this feature is bad or not
   // 1. If the feature is too close
   // 2. If the feature is invalid
-  // 3. If the baseline ratio is large
+  // 3. If the baseline ratio is large 基线比过大->退化
+  // 4. 数值异常（NaN）
+  // 基线比为什么重要？
+  // 因为ratio = ||p_FinA|| / base_line_max = 特征距离 / 最大有效基线
+  // 物理含义：特征离相机有多远 vs 相机之间能提供多少视差
+  // 如果特征距离远大于有效基线（比如 ratio > 100），说明视差极其微小，深度方向几乎不可观测。
+  // 此时 LM 优化可能把特征"推"到无穷远来糊弄残差（z→∞ 时投影趋于固定方向，能压低代价），但这是退化解；
+  // 该检验正是为了拦截这种"看似代价很低、实则深度不可信"的结果
+  // note: 这也解释了为什么前面 single_triangulation 用"条件数"检测、而精化后用"基线比"——因为优化收敛到退化区时，
+  // J^T*J 可能依然良态，但几何上视差已经不足以支撑深度估计，基线比能从几何信息量角度兜底。
   if (feat->p_FinA(2) < _options.min_dist || feat->p_FinA(2) > _options.max_dist ||
       (feat->p_FinA.norm() / base_line_max) > _options.max_baseline || std::isnan(feat->p_FinA.norm())) {
     return false;
@@ -450,7 +532,7 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
 
 /**
  * @brief Compute the error for a given feature and its associated camera poses.
- * 
+ * https://docs.openvins.com/update-featinit.html#featinit-nonlinear 
  * @param clonesCAM 
  * @param feat 
  * @param alpha 
@@ -464,13 +546,13 @@ double FeatureInitializer::compute_error(std::unordered_map<size_t, std::unorder
   // Total error
   double err = 0;
 
-  // Get the position of the anchor pose 锚点坐标系位姿
+  // Get the position of the anchor pose 该特征点的锚点坐标系位姿
   const Eigen::Matrix<double, 3, 3> &R_GtoA = clonesCAM.at(feat->anchor_cam_id).at(feat->anchor_clone_timestamp).Rot();
   const Eigen::Matrix<double, 3, 1> &p_AinG = clonesCAM.at(feat->anchor_cam_id).at(feat->anchor_clone_timestamp).pos();
 
-  // Loop through each camera for this feature
+  // Loop through each camera for this feature 遍历观测到该特征点的所有相机
   for (auto const &pair : feat->timestamps) {
-    // Add CAM_I features
+    // Add CAM_I features 遍历每个相机对该特征点的所有观测
     for (size_t m = 0; m < feat->timestamps.at(pair.first).size(); m++) {
 
       //=====================================================================================
@@ -491,6 +573,8 @@ double FeatureInitializer::compute_error(std::unordered_map<size_t, std::unorder
       //=====================================================================================
 
       // Middle variables of the system
+      // 公式中的h本质上是特征点在Ci坐标系下的3D坐标乘以锚点深度A_Zf的倒数(即除以锚点深度)
+      // 这个缩放对计算预测的归一化坐标 z=[ui,vi] 没有影响
       double hi1 = R_AtoCi(0, 0) * alpha + R_AtoCi(0, 1) * beta + R_AtoCi(0, 2) + rho * p_AinCi(0, 0);
       double hi2 = R_AtoCi(1, 0) * alpha + R_AtoCi(1, 1) * beta + R_AtoCi(1, 2) + rho * p_AinCi(1, 0);
       double hi3 = R_AtoCi(2, 0) * alpha + R_AtoCi(2, 1) * beta + R_AtoCi(2, 2) + rho * p_AinCi(2, 0);

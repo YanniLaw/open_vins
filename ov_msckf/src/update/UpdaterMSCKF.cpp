@@ -152,29 +152,38 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     it1++;
   }
   rT2 = boost::posix_time::microsec_clock::local_time();
-
+  // 构造大线性系统之前的"预分配 + 记账结构初始化"。
+  // 目的是：为接下来要堆叠所有特征方程的大矩阵 Hx_big/res_big 预先申请好足够的存储空间，并初始化好"状态列块"的登记表。
   // Calculate the max possible measurement size
-  size_t max_meas_size = 0;
+  // 计算所有特征观测的最大可能测量维度(行数)，用于预分配残差向量的大小。
+  // 得到所有特征原始测量的总行数（在零空间投影、卡方剔除之前），作为 res_big 行数的上界
+  // 注意为什么是"最大可能"：此时 feature_vec 只是通过了三角化，第 4 步里还会有特征被卡方检验剔除，且零空间投影会让每个特征的行数从 
+  // 2n 减到 2n−3。所以这个值只是上限，真正用多少行要等第 4 步跑完才知道（后面用 conservativeResize 收缩）。
+  size_t max_meas_size = 0; // 最大可能测量维数（行数）
   for (size_t i = 0; i < feature_vec.size(); i++) {
-    for (const auto &pair : feature_vec.at(i)->timestamps) {
-      max_meas_size += 2 * feature_vec.at(i)->timestamps[pair.first].size();
+    for (const auto &pair : feature_vec.at(i)->timestamps) { // 遍历每个特征 × 每个相机，累加该相机对该特征的观测次数
+      max_meas_size += 2 * feature_vec.at(i)->timestamps[pair.first].size(); // 每个观测是归一化坐标(u,v)两个维度
     }
   }
 
   // Calculate max possible state size (i.e. the size of our covariance)
   // NOTE: that when we have the single inverse depth representations, those are only 1dof in size
-  size_t max_hx_size = state->max_covariance_size();
+  // 如果特征用逆深度表示，max_covariance_size() 里的相关处理会把路标按 1 自由度计
+  // 得到的 max_hx_size 是 Hx_big 列数的上界：实际参与本次更新的状态（只有被特征观测到的克隆/外参/内参）通常小于这个值
+  size_t max_hx_size = state->max_covariance_size(); // 最大可能状态维数（列数）
   for (auto &landmark : state->_features_SLAM) {
+    // SLAM 路标是单独用 UpdaterSLAM 更新的，不会出现在本函数 Hx_big 的列里——所以要把它们的维度从"最大状态大小"里扣掉，避免浪费列空间；
     max_hx_size -= landmark.second->size();
   }
 
   // Large Jacobian and residual of *all* features for this update
+  // 预分配大矩阵 + 记账结构
   Eigen::VectorXd res_big = Eigen::VectorXd::Zero(max_meas_size);
   Eigen::MatrixXd Hx_big = Eigen::MatrixXd::Zero(max_meas_size, max_hx_size);
-  std::unordered_map<std::shared_ptr<Type>, size_t> Hx_mapping;
-  std::vector<std::shared_ptr<Type>> Hx_order_big;
-  size_t ct_jacob = 0;
-  size_t ct_meas = 0;
+  std::unordered_map<std::shared_ptr<Type>, size_t> Hx_mapping; // 状态类型 → 列偏移
+  std::vector<std::shared_ptr<Type>> Hx_order_big; // 状态类型的有序列表
+  size_t ct_jacob = 0; // 已登记的状态列数
+  size_t ct_meas = 0;  // 已填入的测量行数
 
   // 4. Compute linear system for each feature, nullspace project, and reject
   auto it2 = feature_vec.begin();
@@ -205,9 +214,9 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     }
 
     // Our return values (feature jacobian, state jacobian, residual, and order of state jacobian)
-    Eigen::MatrixXd H_f;
-    Eigen::MatrixXd H_x;
-    Eigen::VectorXd res;
+    Eigen::MatrixXd H_f; // 残差对特征点的雅可比矩阵 2n x 3(或2n x 1)
+    Eigen::MatrixXd H_x; // 残差对状态的雅可比矩阵   2n x 状态维数
+    Eigen::VectorXd res; // 残差向量(重投影)        2n x 1 
     std::vector<std::shared_ptr<Type>> Hx_order;
 
     // Get the Jacobian for this feature
