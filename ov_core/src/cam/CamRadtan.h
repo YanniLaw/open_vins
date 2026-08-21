@@ -147,6 +147,7 @@ public:
 
   /**
    * @brief Computes the derivative of raw distorted to normalized coordinate.
+   * 具体公式参考https://docs.openvins.com/update-feat.html#distortion-radtan
    * @param uv_norm Normalized coordinates we wish to distort
    * @param H_dz_dzn Derivative of measurement z in respect to normalized
    * @param H_dz_dzeta Derivative of measurement z in respect to intrinic parameters

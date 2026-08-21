@@ -31,18 +31,28 @@ using namespace ov_msckf;
 
 /**
  * @brief 计算全局特征位置对特征表示参数的导数(以及必要时对锚点状态的导数)
+ * 参考 https://docs.openvins.com/update-feat.html#feat-rep
  * 因为这部分只与特征表示和锚点有关、与具体观测无关，所以在 get_feature_jacobian_full 中每个特征只调用一次，
  * 把结果（dpfg_dlambda、dpfg_dx、dpfg_dx_order）提到观测循环外面复用。
+ * 随后在观测循环里用链式法则合成: 
+ * ∂z/∂x = ∂z/∂C_Pf * ∂C_Pf/∂G_Pf * ∂G_Pf/∂x
+ * 这里的 ∂G_Pf/∂x 就是本函数计算的内容
+ * 注意: H_x 是 vector，不是矩阵：因为每个锚点相关的状态（克隆、外参）尺寸不同，用 vector<MatrixXd> 逐块存放，
+ * 并用 x_order 一一对应记录是哪份状态。后续在 get_feature_jacobian_full 中通过 map_hx 把块放进大矩阵 Hx 的对应列
+ * 输出被消费的方式: 
+ * 特征部分: Hf^观测 = ∂z/∂G_Pf*Hf^本函数(就是循环里的dz_dpfg * dpfg_dlambda) λ是特征表示相关的状态
+ * 锚点状态部分:   ∂z/ ∂x_anchor = ∂z/∂G_Pf*∂G_Pf/∂x_anchor(就是循环里的dz_dpfg * dpfg_dx.at(i)) x是锚点相关的状态
  * @param state 
  * @param feature 
- * @param H_f 
- * @param H_x 
+ * @param H_f 输出: 全局特征位置对特征表示的雅可比矩阵
+ * @param H_x 输出: 全局特征位置对锚点状态或者标定状态的雅可比矩阵(如果不是锚点表示则不计算，不开启标定也不计算)
  * @param x_order 
  */
 void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> state, UpdaterHelperFeature &feature, Eigen::MatrixXd &H_f,
                                                         std::vector<Eigen::MatrixXd> &H_x, std::vector<std::shared_ptr<Type>> &x_order) {
 
   // Global XYZ representation
+  // G_Pf = f(λ) = [G_x, G_y, G_z]^T , λ = [G_x, G_y, G_z]^T, ∂f(λ)/∂λ = I_3x3
   if (feature.feat_representation == LandmarkRepresentation::Representation::GLOBAL_3D) {
     H_f.resize(3, 3);
     H_f.setIdentity();
@@ -50,10 +60,11 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
   }
 
   // Global inverse depth representation 全局球坐标逆深度
-  // 参数 λ=[θ,ϕ,ρ]^T (方位角、极角、逆深度)，表示函数为(球坐标): 
+  // 参数 λ = [θ,ϕ,ρ]^T (方位角、极角、逆深度)，表示函数为(球坐标): 
   //                 | cosθ sinϕ |
-  //  G_Pf = 1 / ρ * | sinθ sinϕ |
+  //  G_Pf = 1 / ρ * | sinθ sinϕ | = f(λ)
   //                 |    cosϕ   |
+  // ∂f(λ)/∂λ = [...]3x3
   if (feature.feat_representation == LandmarkRepresentation::Representation::GLOBAL_FULL_INVERSE_DEPTH) {
 
     // Get the feature linearization point
@@ -87,6 +98,9 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
   //======================================================================
   //======================================================================
   //======================================================================
+  // 下面都是用锚点系表示的一些计算!!!!!
+  // 所以除了对特征表示参数求导外，还要额外对锚点状态求导
+  // 对锚点状态求导(其实就是对锚点位姿求导)，得到雅可比矩阵 H_x
 
   // Assert that we have an anchor pose for this feature
   assert(feature.anchor_cam_id != -1); // 确保确实是有锚点相机的
@@ -100,17 +114,30 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
 
   // If I am doing FEJ, I should FEJ the anchor states (should we fej calibration???)
   // Also get the FEJ position of the feature if we are
+  // FEJ 处理（关键细节）：目的是把锚点相关雅可比固定在 FEJ 线性化点上（保持可观性性质）。
+  // 注意它只对锚点状态做 FEJ，外参 R_ItoC/p_IinC 刻意不做
   if (state->_options.do_fej) {
     // "Best" feature in the global frame
+    // 用"当前"锚点状态把特征转到全局系，得到"best"全局位置
     Eigen::Vector3d p_FinG_best = R_GtoI.transpose() * R_ItoC.transpose() * (feature.p_FinA - p_IinC) + p_IinG;
     // Transform the best into our anchor frame using FEJ
+    // 换成 FEJ（第一估计）锚点状态，再转回锚点相机系
     R_GtoI = state->_clones_IMU.at(feature.anchor_clone_timestamp)->Rot_fej();
     p_IinG = state->_clones_IMU.at(feature.anchor_clone_timestamp)->pos_fej();
     p_FinA = (R_GtoI.transpose() * R_ItoC.transpose()).transpose() * (p_FinG_best - p_IinG) + p_IinC;
   }
   Eigen::Matrix3d R_CtoG = R_GtoI.transpose() * R_ItoC.transpose();
 
-  // Jacobian for our anchor pose
+  // Jacobian for our anchor pose，锚点姿态雅可比
+  // 见文档 https://docs.openvins.com/update-feat.html#feat-rep-anchor-xyz
+  // G_Pf = f(λ, R_GtoIa，P_IainG, R_ItoC, P_IinC) 
+  //      = R_GtoIa^T * R_ItoC^T * (λ - P_IinC) + P_IainG
+  // 其中 λ = Ca_Pf = [Ca_x, Ca_y, Ca_z]^T, 是锚点系下的特征位置
+  // 所以，∂f(*)/∂λ = R_GtoIa^T * R_ItoC^T
+  // 由于锚点位姿涉及到这种特征表示，所以需要对锚点位姿求导，得到雅可比矩阵 H_anc
+  // 对锚点克隆位姿的雅可比就是对 R_GtoIa 和 P_IainG 的偏导数：
+  // ∂f(*)/∂R_GtoIa = -R_GtoIa^T * skew_x(R_ItoC^T * (λ - P_IinC))
+  // ∂f(*)/∂P_IainG = I_3x3
   Eigen::Matrix<double, 3, 6> H_anc;
   H_anc.block(0, 0, 3, 3).noalias() = -R_GtoI.transpose() * skew_x(R_ItoC.transpose() * (p_FinA - p_IinC));
   H_anc.block(0, 3, 3, 3).setIdentity();
@@ -119,7 +146,9 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
   x_order.push_back(state->_clones_IMU.at(feature.anchor_clone_timestamp));
   H_x.push_back(H_anc);
 
-  // Get calibration Jacobians (for anchor clone)
+  // Get calibration Jacobians (for anchor clone) 锚点相机外参雅可比，同样见如上的文档
+  // ∂f(*)/∂R_ItoC = -R_GtoIa^T * R_ItoC^T * skew_x(λ - P_IinC)
+  // ∂f(*)/∂P_IinC = -R_GtoIa^T * R_ItoC^T
   if (state->_options.do_calib_camera_pose) {
     Eigen::Matrix<double, 3, 6> H_calib;
     H_calib.block(0, 0, 3, 3).noalias() = -R_CtoG * skew_x(p_FinA - p_IinC);
@@ -129,12 +158,15 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
   }
 
   // If we are doing anchored XYZ feature
+  // Anchored XYZ
   if (feature.feat_representation == LandmarkRepresentation::Representation::ANCHORED_3D) {
+    // 表示参数: 锚点系XYZ  H_f = R_CtoG
     H_f = R_CtoG;
     return;
   }
 
   // If we are doing full inverse depth
+  // Anchored Inverse Depth
   if (feature.feat_representation == LandmarkRepresentation::Representation::ANCHORED_FULL_INVERSE_DEPTH) {
 
     // Get inverse depth representation (should match what is in Landmark.cpp)
@@ -155,6 +187,8 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
     // assert(p_invFinA(2,0)>=0.0);
 
     // Jacobian of anchored 3D position wrt inverse depth parameters
+    // 见公式 https://docs.openvins.com/update-feat.html#feat-rep-anchor-inv
+    // 表示参数  [θ,ϕ,ρ]（锚点系球坐标） H_f = R_CtoG * ∂_Ca_Pf/∂[θ,ϕ,ρ]
     Eigen::Matrix<double, 3, 3> d_pfinA_dpinv;
     d_pfinA_dpinv << -(1.0 / rho) * sin_th * sin_phi, (1.0 / rho) * cos_th * cos_phi, -(1.0 / (rho * rho)) * cos_th * sin_phi,
         (1.0 / rho) * cos_th * sin_phi, (1.0 / rho) * sin_th * cos_phi, -(1.0 / (rho * rho)) * sin_th * sin_phi, 0.0,
@@ -178,6 +212,8 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
     double rho = p_invFinA_MSCKF(2, 0);
 
     // Jacobian of anchored 3D position wrt inverse depth parameters
+    // 见公式 https://docs.openvins.com/update-feat.html#feat-rep-anchor-inv2
+    // 参数 [α,β,ρ]=[x/z, y/z, 1/z]， H_f = R_CtoG * ∂_Ca_Pf/∂[α,β,ρ]
     Eigen::Matrix<double, 3, 3> d_pfinA_dpinv;
     d_pfinA_dpinv << (1.0 / rho), 0.0, -(1.0 / (rho * rho)) * alpha, 0.0, (1.0 / rho), -(1.0 / (rho * rho)) * beta, 0.0, 0.0,
         -(1.0 / (rho * rho));
@@ -193,7 +229,8 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
     Eigen::Vector3d bearing = rho * p_FinA;
 
     // Jacobian of anchored 3D position wrt inverse depth parameters
-    Eigen::Vector3d d_pfinA_drho;
+    // 参数 ρ = 1/z， H_f = R_CtoG * ∂_Ca_Pf/∂ρ
+    Eigen::Vector3d d_pfinA_drho; // - (1/ρ^2) * bearing
     d_pfinA_drho << -(1.0 / (rho * rho)) * bearing;
     H_f = R_CtoG * d_pfinA_drho;
     return;
@@ -205,23 +242,38 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
 
 /**
  * @brief Compute the full Jacobian for a given feature with respect to the feature itself and the involved states.
- * 为单个特征构造完整线性化测量模型。把一个特征在所有相机、所有时刻的观测堆叠起来，
- * 输出残差 r、特征雅可比Hf、状态雅可比Hx以及涉及的状态列表。目标是把下面这个线性化方程建立出来：
+ *  一般来说，MSCKF的目标是把下面这个线性化方程：
  *  r = H_f * delta_f + H_x * delta_x
- * 对于某一次观测，测量值是去畸变后的像素坐标(u,v)，预测值来自投影链:
- * pIi = R_GtoIi * (p_FinG - p_IinG)  // 全局系下的特征坐标 → 当前相机系下的特征坐标
- * pCi = R_ItoCi * pIi + p_IinCi // 当前相机系下的特征坐标 → 当前相机像素坐标
- * z = distort([x/z]) , [x,y,z]^T = pCi // 当前相机像素坐标 → 去畸变后的归一化像素坐标(u,v)
+ *  openvins为了构造完整的线性化观测模型，把该特征在所有相机、所有时刻的观测堆叠成一个大的线性方程:
+ *  r = H_f * δλ + H_x * δx + n
+ * 其中，r 残差(2nx1,每个观测贡献u,v两行)
+ * H_f: 对特征参数误差δλ的雅可比矩阵(2nx3或2nx1，视表示方式而定)
+ * H_x: 对状态误差的雅可比矩阵(2nxm.m为设计状态总维数)
+ * 投影链(即h_d ∘ h_p ∘ h_t):
+ * Ii_Pf = R_GtoIi(P_FinG - P_IiinG), Ci_Pf = R_ItoCi*Ii_Pf + P_IinCi
+ * zn =  hp(Ci_Pf) = [x/z, y/z]^T  z = hd(zn,ζ)
+ * 线性化后对某状态 x 的雅可比就是文档里的链式法则公式
+ * ∂z    ∂hd    ∂hp  | ∂Ci_Pf   ∂Ci_Pf     ∂G_Pf |
+ * —— =   ——    ——   |   ——   +   ——    *   ——   |
+ * ∂x    ∂zn  ∂Ci_Pf |   ∂x     ∂G_Pf       ∂x   |
+ *                                  对锚点/表示
+ * 其中 ∂hd/∂zn就是dz_dzn
+ * ∂hp/∂Ci_Pf就是dzn_dpfc
+ * 
+ * 对于某一次观测，测量值是带畸变的像素坐标(u,v)，预测值来自投影链:
+ * pIi = R_GtoIi * (p_FinG - p_IinG)  // 全局系下的特征坐标 → 当前IMU系下的特征坐标
+ * pCi = R_ItoCi * pIi + p_IinCi      // 当前IMU系下的特征坐标 → 当前相机系下的特征坐标
+ * z = distort([x/z]) , [x,y,z]^T = pCi // 当前相机系下的特征坐标 → 去畸变后的归一化像素坐标(u,v)
  *             [y/z]
  * 
  * 残差 r = zm - zo,线性化后对状态和特征分别求导，就得到H_x和H_f。
  * 注意，H_x是一个大矩阵，列数是所有涉及状态的总维数，行数是该特征的总观测次数*2。
  * @param state 滤波器状态
- * @param feature 特征（含所有观测、三角化均值）
+ * @param feature 给定单个特征（含所有观测、三角化均值）
  * @param H_f 输出：观测对特征误差的雅可比 2n x 3(或2n x 1)  视表达方式而定
  * @param H_x 输出：观测对状态误差的雅可比 2n x 状态维数
  * @param res 输出：测量残差 2n x1 
- * @param x_order 输出：H_x 各列对应的状态列表
+ * @param x_order 输出：记录H_x 各列对应的状态对象
  */
 void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, UpdaterHelperFeature &feature, Eigen::MatrixXd &H_f,
                                               Eigen::MatrixXd &H_x, Eigen::VectorXd &res, std::vector<std::shared_ptr<Type>> &x_order) {
@@ -251,7 +303,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       total_hx += calibration->size();
     }
 
-    // If doing calibration intrinsics 相机内参以及畸变
+    // If doing calibration intrinsics 相机内参以及畸变 8维
     if (state->_options.do_calib_camera_intrinsics) {
       map_hx.insert({distortion, total_hx});
       x_order.push_back(distortion);
@@ -299,13 +351,14 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       }
     }
   }
+  // 这样 H_x 的列数 total_hx 就是所有相关状态维数的总和，而 map_hx 记录每个状态对象在 H_x 中的起始列索引
 
   //=========================================================================
   //=========================================================================
 
   // Calculate the position of this feature in the global frame
   // If anchored, then we need to calculate the position of the feature in the global
-  // 把特征位置统一到全局系
+  // 把特征位置统一到全局系G_Pf
   // 非锚点表示直接使用全局坐标；锚点表示则通过锚点位姿把 p_FinA 变换到全局系，方便后面所有观测统一投影。
   // FEJ 时使用第一估计值。
   Eigen::Vector3d p_FinG = feature.p_FinG;
@@ -319,6 +372,10 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
     Eigen::Matrix3d R_GtoI = state->_clones_IMU.at(feature.anchor_clone_timestamp)->Rot();
     Eigen::Vector3d p_IinG = state->_clones_IMU.at(feature.anchor_clone_timestamp)->pos();
     // Feature in the global frame
+    // 通过锚点外参以及锚点克隆位姿把锚点系下的特征点坐标P_FinA变换到全局
+    // 其实就是一个 A_Pf(也就是C_Pf) -> I_Pf -> G_Pf 的转换
+    // p_FinG = R_GtoI^T * R_ItoC^T * (p_FinA - p_IinC) + p_IinG
+    // 这样后面每个观测都能用同一个全局点统一投影
     p_FinG = R_GtoI.transpose() * R_ItoC.transpose() * (feature.p_FinA - p_IinC) + p_IinG;
   }
 
@@ -343,10 +400,10 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
 
   // Derivative of p_FinG in respect to feature representation.
   // This only needs to be computed once and thus we pull it out of the loop
-  // 这部分只与特征表示有关，与具体观测无关，所以只算一次，在循环外提取
-  Eigen::MatrixXd dpfg_dlambda; // 全局特征位置P_FinG对特征表示参数λ的导数
-  std::vector<Eigen::MatrixXd> dpfg_dx; // 全局特征位置P_FinG对锚点状态（锚点位姿、锚点外参）的导数，及其对应的状态列表
-  std::vector<std::shared_ptr<Type>> dpfg_dx_order;
+  // 这部分只与特征表示和锚点有关，与具体观测无关，所以只算一次，在循环外提取并复用
+  Eigen::MatrixXd dpfg_dlambda; // 全局特征位置P_FinG对特征表示参数λ的导数 ∂^Gpf/∂λ
+  std::vector<Eigen::MatrixXd> dpfg_dx; // 全局特征位置P_FinG对锚点状态（锚点位姿、锚点外参）的导数，∂^Gpf/∂x_anchor（多块）
+  std::vector<std::shared_ptr<Type>> dpfg_dx_order; // 记录 dpfg_dx 中每块对应的状态对象，方便后续在 H_x 中放置雅可比块
   UpdaterHelper::get_feature_jacobian_representation(state, feature, dpfg_dlambda, dpfg_dx, dpfg_dx_order);
 
   // Assert that all the ones in our order are already in our local jacobian mapping
@@ -413,20 +470,22 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
 
       // Compute Jacobians in respect to normalized image coordinates and possibly the camera intrinsics
       // 畸变对归一化坐标/内参的导数
+      // https://docs.openvins.com/update-feat.html#distortion
+      // 分别是公式中的∂hd(.)/∂zn,k, ∂hd(.)/∂ζ
       Eigen::MatrixXd dz_dzn, dz_dzeta;
       state->_cam_intrinsics_cameras.at(pair.first)->compute_distort_jacobian(uv_norm, dz_dzn, dz_dzeta);
 
       // Normalized coordinates in respect to projection function
-      // 归一化坐标对相机系3D点（投影函数）的导数
+      // 归一化坐标对相机系3D点（投影函数）的导数 ∂zn/∂^Cpf
       Eigen::MatrixXd dzn_dpfc = Eigen::MatrixXd::Zero(2, 3);
       dzn_dpfc << 1 / p_FinCi(2), 0, -p_FinCi(0) / (p_FinCi(2) * p_FinCi(2)), 0, 1 / p_FinCi(2), -p_FinCi(1) / (p_FinCi(2) * p_FinCi(2));
 
       // Derivative of p_FinCi in respect to p_FinIi
-      // p_FC 对 p_FG 的导数（旋转链）
+      // p_FC 对 p_FG 的导数（旋转链） ∂^Cpf/∂^Gpf
       Eigen::MatrixXd dpfc_dpfg = R_ItoC * R_GtoIi;
 
       // Derivative of p_FinCi in respect to camera clone state
-      // p_FC 对克隆6自由度位姿的导数（旋转3+平移3）
+      // p_FC 对克隆6自由度位姿的导数（旋转3+平移3） ∂^Cpf/∂克隆位姿
       Eigen::MatrixXd dpfc_dclone = Eigen::MatrixXd::Zero(3, 6);
       dpfc_dclone.block(0, 0, 3, 3).noalias() = R_ItoC * skew_x(p_FinIi);
       dpfc_dclone.block(0, 3, 3, 3) = -dpfc_dpfg;
@@ -449,7 +508,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
 
       // CHAINRULE: loop through all extra states and add their
       // NOTE: we add the Jacobian here as we might be in the anchoring pose for this measurement
-      // ③ 额外状态（锚点位姿/锚点外参）雅可比：累加
+      // ③ 锚点状态（锚点位姿/锚点外参）雅可比：累加
       for (size_t i = 0; i < dpfg_dx_order.size(); i++) {
         H_x.block(2 * c, map_hx[dpfg_dx_order.at(i)], 2, dpfg_dx_order.at(i)->size()).noalias() += dz_dpfg * dpfg_dx.at(i);
       }
@@ -458,7 +517,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       //=========================================================================
 
       // Derivative of p_FinCi in respect to camera calibration (R_ItoC, p_IinC)
-      // 相机外参与内参雅可比
+      // ④相机外参与内参雅可比 累加
       if (state->_options.do_calib_camera_pose) {
 
         // Calculate the Jacobian
@@ -472,6 +531,7 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
       }
 
       // Derivative of measurement in respect to distortion parameters
+      // ⑤ 内参畸变
       if (state->_options.do_calib_camera_intrinsics) {
         H_x.block(2 * c, map_hx[distortion], 2, distortion->size()) = dz_dzeta; // 畸变参数
       }
