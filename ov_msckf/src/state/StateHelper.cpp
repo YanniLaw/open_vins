@@ -282,11 +282,32 @@ void StateHelper::set_initial_covariance(std::shared_ptr<State> state, const Eig
   state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>();
 }
 
+/**
+ * @brief 从全局协方差里“抠”出指定状态子集的协方差子块
+ * 主要用在两个地方:
+ * 1. EKF 更新的新息协方差 S = H*P_small*H' + R 因为量测只跟 H_order 里的那部分状态有关，不需要拿全协方差去算
+ * 2. 更新前的卡方检验 chi2 = r^T*(Hz*P_marg*Hz^T + σ^2*I)^{-1}*r 每帧有几百上千个特征，
+ * 每个特征都拿全协方差做一次S^-1是不现实的，所以只取它涉及的那几个状态
+ * 原理：为什么“子块就是边缘协方差”?
+ * 对高斯分布，边缘化掉其他变量后，剩余变量的协方差恰好就是联合协方差中对应的子块（这是高斯分布的性质，不需要 Schur 补）:
+ * x = [x1, x2]^T ~ N([μ1, μ2]^T, [[P11, P12], [P21, P22]])
+ * 则 x1 ~ N(μ1, P11)，x2 ~ N(μ2, P22)，即边缘协方差就是联合协方差的子块
+ * 所以这个函数不需要做任何“真正的边缘化计算”，直接按块拷贝 state->_Cov 里对应位置即可。
+ * 注意： 
+ * 1. 它不是“条件化/真正边缘化状态”：它不改变 state->_Cov、不删除任何变量，只是返回一个拷贝，是只读操作。
+ * 真正删状态用的是 marginalize（那是做块删除，也仍然不做 Schur 补，MSCKF 里旧的克隆信息不再需要）。
+ * 2. 对称性：全局 state->_Cov 始终被维护为对称矩阵（各写回函数最后都 selfadjointView<Upper>() 镜像对称），所以抠出来的子块理论上也是对称的。
+ * 代码末尾那行被注释掉的 // Small_cov = 0.5*(Small_cov+Small_cov.transpose()); 只是防御性的保险，平时不开启
+ * 3. 性能：双循环是O(N^2) 次块拷贝，但每个特征只涉及 2~3 个状态，块都很小，开销可忽略；对比直接拿全协方差做 S^-1 要省得多
+ * @param state 当前滤波器状态
+ * @param small_variables 指定的小状态变量列表
+ * @return Eigen::MatrixXd 对应的小状态变量的边缘协方差矩阵（含所有交叉项）
+ */
 Eigen::MatrixXd StateHelper::get_marginal_covariance(std::shared_ptr<State> state,
                                                      const std::vector<std::shared_ptr<Type>> &small_variables) {
 
   // Calculate the marginal covariance size we need to make our matrix
-  int cov_size = 0;
+  int cov_size = 0; // 返回矩阵的维数
   for (size_t i = 0; i < small_variables.size(); i++) {
     cov_size += small_variables[i]->size();
   }
@@ -297,10 +318,11 @@ Eigen::MatrixXd StateHelper::get_marginal_covariance(std::shared_ptr<State> stat
   // For each variable, lets copy over all other variable cross terms
   // Note: this copies over itself to when i_index=k_index
   int i_index = 0;
-  for (size_t i = 0; i < small_variables.size(); i++) {
+  for (size_t i = 0; i < small_variables.size(); i++) { // 行方向：小矩阵的第 i 个块
     int k_index = 0;
-    for (size_t k = 0; k < small_variables.size(); k++) {
+    for (size_t k = 0; k < small_variables.size(); k++) { // 列方向：小矩阵的第 k 个块
       Small_cov.block(i_index, k_index, small_variables[i]->size(), small_variables[k]->size()) =
+          // 全局协方差的起始行列
           state->_Cov.block(small_variables[i]->id(), small_variables[k]->id(), small_variables[i]->size(), small_variables[k]->size());
       k_index += small_variables[k]->size();
     }

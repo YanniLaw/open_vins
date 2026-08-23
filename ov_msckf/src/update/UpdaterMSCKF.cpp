@@ -158,7 +158,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   // 计算所有特征观测的最大可能测量维度(行数)，用于预分配残差向量的大小。
   // 得到所有特征原始测量的总行数（在零空间投影、卡方剔除之前），作为 res_big 行数的上界
   // 注意为什么是"最大可能"：此时 feature_vec 只是通过了三角化，第 4 步里还会有特征被卡方检验剔除，且零空间投影会让每个特征的行数从 
-  // 2n 减到 2n−3。所以这个值只是上限，真正用多少行要等第 4 步跑完才知道（后面用 conservativeResize 收缩）。
+  // 2m 减到 2m−3。所以这个值只是上限，真正用多少行要等第 4 步跑完才知道（后面用 conservativeResize 收缩）。
   size_t max_meas_size = 0; // 最大可能测量维数（行数）
   for (size_t i = 0; i < feature_vec.size(); i++) {
     for (const auto &pair : feature_vec.at(i)->timestamps) { // 遍历每个特征 × 每个相机，累加该相机对该特征的观测次数
@@ -214,22 +214,28 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     }
 
     // Our return values (feature jacobian, state jacobian, residual, and order of state jacobian)
-    Eigen::MatrixXd H_f; // 残差对特征点的雅可比矩阵 2n x 3(或2n x 1)
-    Eigen::MatrixXd H_x; // 残差对状态的雅可比矩阵   2n x 状态维数
-    Eigen::VectorXd res; // 残差向量(重投影)        2n x 1 
+    Eigen::MatrixXd H_f; // 残差对特征点的雅可比矩阵 2m x 3(或2m x 1)
+    Eigen::MatrixXd H_x; // 残差对状态的雅可比矩阵   2m x 状态维数
+    Eigen::VectorXd res; // 残差向量(重投影)        2m x 1 
     std::vector<std::shared_ptr<Type>> Hx_order;
 
     // Get the Jacobian for this feature
     UpdaterHelper::get_feature_jacobian_full(state, feat, H_f, H_x, res, Hx_order);
 
     // Nullspace project 零空间投影
+    // 经过零空间投影后，H_f 被消掉，H_x 和 res 被变换为 Hx' = Q^T Hx, res' = Q^T res，其中 Q 是由所有 Givens 旋转组成的正交矩阵。
     UpdaterHelper::nullspace_project_inplace(H_f, H_x, res);
 
     /// Chi2 distance check
-    Eigen::MatrixXd P_marg = StateHelper::get_marginal_covariance(state, Hx_order);
+    Eigen::MatrixXd P_marg = StateHelper::get_marginal_covariance(state, Hx_order); // 获取当前特征观测涉及的状态的边缘协方差矩阵
     Eigen::MatrixXd S = H_x * P_marg * H_x.transpose();
+    // 构造投影后量测的新息协方差 S = H_x * P_marg * H_x^T + σ_pix^2 * I，其中 σ_pix^2 * I 是像素噪声协方差
+    // 注意： 零空间投影用的是正交矩阵Q2， 所以噪声仍是 isotropic的，投影后仍然是 σ_pix^2 * I，直接加在 S 的对角线上是正确的。
     S.diagonal() += _options.sigma_pix_sq * Eigen::VectorXd::Ones(S.rows());
+    // 计算卡方统计量 chi2 = res^T * S^-1 * res  等于马氏距离平方
+    // 用 Cholesky 分解(S.llt().solve(res))求解线性方程 S * x = res，得到 x = S^-1 * res，然后再点乘 res 得到 chi2
     double chi2 = res.dot(S.llt().solve(res));
+    // 此时残差维度为2m-3，S是2m-3 x 2m-3的矩阵，chi2是标量。 自由度就是res.rows()
 
     // Get our threshold (we precompute up to 500 but handle the case that it is more)
     double chi2_check;
@@ -242,7 +248,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     }
 
     // Check if we should delete or not
-    if (chi2 > _options.chi2_multipler * chi2_check) {
+    if (chi2 > _options.chi2_multipler * chi2_check) { // 该特征为外点（动态物体、误三角化、观测异常），直接删除并跳过堆叠
       (*it2)->to_delete = true;
       it2 = feature_vec.erase(it2);
       // PRINT_DEBUG("featid = %d\n", feat.featid);

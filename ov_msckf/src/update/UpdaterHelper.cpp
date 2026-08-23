@@ -269,11 +269,11 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
  * 残差 r = zm - zo,线性化后对状态和特征分别求导，就得到H_x和H_f。
  * 注意，H_x是一个大矩阵，列数是所有涉及状态的总维数，行数是该特征的总观测次数*2。
  * @param state 滤波器状态
- * @param feature 给定单个特征（含所有观测、三角化均值）
- * @param H_f 输出：观测对特征误差的雅可比 2n x 3(或2n x 1)  视表达方式而定
- * @param H_x 输出：观测对状态误差的雅可比 2n x 状态维数
- * @param res 输出：测量残差 2n x1 
- * @param x_order 输出：记录H_x 各列对应的状态对象
+ * @param feature 特征（含所有观测、三角化均值）
+ * @param H_f 输出：观测对特征误差的雅可比 2m x 3(或2m x 1)  视表达方式而定
+ * @param H_x 输出：观测对状态误差的雅可比 2m x 状态维数
+ * @param res 输出：测量残差 2m x1 
+ * @param x_order 输出：H_x 各列对应的状态列表
  */
 void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, UpdaterHelperFeature &feature, Eigen::MatrixXd &H_f,
                                               Eigen::MatrixXd &H_x, Eigen::VectorXd &res, std::vector<std::shared_ptr<Type>> &x_order) {
@@ -545,9 +545,28 @@ void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, Upda
 /**
  * @brief 零空间投影 把特征点误差 δf 从量测方程里消掉，只保留对状态误差 δx 的约束
  * 原始线性化量测模型可以写成 r = Hx δx + Hf δf + n
- * @param H_f 
- * @param H_x 
- * @param res 
+ * 要把Hf这项从方程中消掉，做法是对Hf做QR分解，得到Hf = Q [R; 0]，然后左乘Q^T，得到
+ * Hf = [Q1  Q2] [R1] = Q1 R1
+ *               [0 ]
+ * 其中Q2(2m x (2m-3)) 张成了Hf的左零空间，因为Q2^T*Hf = Q2^T*Q1*R1 = 0，所以左乘Q2^T就可以把Hf消掉，得到
+ * Q2^T r = Q2^T Hx δx + Q2^T Hf δf + Q2^T n  
+ * 即 r0 = Ho δx + n0
+ * 也就是只保留了对状态误差 δx 的约束。这个过程就是零空间投影。
+ * 量测维度从2m 降到了 2m-3，之后用r0和Ho去走标准EKF更新即可。
+ * 但是为什么代码中用GINVENS旋转来做零空间投影而不是直接用QR分解呢？
+ * 因为QR分解会产生一个正交矩阵Q，Q的列数是Hf的行数，Hf是2m x 3(或1)的矩阵，所以Q是2m x 2m的矩阵，
+ * 左乘Q^T会把r和Hx都变成2m维的向量和矩阵，而我们只需要保留2m-3维的约束，
+ * 所以用Givens旋转可以直接把Hf变成上三角矩阵，然后把下方的零空间投影掉，得到Ho和r0。
+ * 代码中用Ginvens旋转，并且不显示构造Q，直接对增广矩阵[Hf | Hx | r]原地做行旋转
+ * Givens Rotation 的优势:
+ * 1. 不需要显式构造Q矩阵，节省内存和计算量
+ * 2. 非常容易同时变换增广矩阵 Hf Hx 和 r，保证线性化方程的一致性
+ * 3. 对稀疏矩阵更高效，因为每次旋转只影响两行，计算量小   非常适合这种“小列数、长行数”的矩阵
+ * 4. 数值稳定性好，适合在迭代优化中使用
+ * 5. 直接原地操作矩阵，cache locality / 内存开销更好
+ * @param H_f 残差对特征误差的雅可比 2m x 3(或2m x 1) m是该特征的总观测次数，投影后变为0
+ * @param H_x 残差对状态误差的雅可比 2m x 状态维数  投影后变为 2m-3 x 状态维数
+ * @param res 残差 2m x 1, 投影后变为 2m-3 x 1
  */
 void UpdaterHelper::nullspace_project_inplace(Eigen::MatrixXd &H_f, Eigen::MatrixXd &H_x, Eigen::VectorXd &res) {
 
@@ -555,23 +574,45 @@ void UpdaterHelper::nullspace_project_inplace(Eigen::MatrixXd &H_f, Eigen::Matri
   // Based on "Matrix Computations 4th Edition by Golub and Van Loan"
   // See page 252, Algorithm 5.2.4 for how these two loops work
   // They use "matlab" index notation, thus we need to subtract 1 from all index
+  // 核心 Givens 旋转消元过程：: 
+  // 对增广矩阵[Hf | Hx | r]原地执行正交变换，将Hf变为上三角矩阵，同时将相同的变换应用到Hx和r上，从而自动实现零空间投影。
+  // Givens 旋转 是一种实现 QR 分解的数值稳定算法，它通过一系列平面旋转变换，逐个将 H_f 的下三角元素消为零。
+  // 每次旋转只影响两行，计算量小，适合稀疏矩阵
   Eigen::JacobiRotation<double> tempHo_GR;
   for (int n = 0; n < H_f.cols(); ++n) {
-    for (int m = (int)H_f.rows() - 1; m > n; m--) {
+    for (int m = (int)H_f.rows() - 1; m > n; m--) { // 从最后一行向上，直到 n+1
       // Givens matrix G
-      tempHo_GR.makeGivens(H_f(m - 1, n), H_f(m, n));
+      // 输入两个数a = H_f(m - 1, n), b = H_f(m, n)，构造一个旋转矩阵G，使得G * [a; b] = [r; 0]，即把下方的元素消为零
+      // 其中 r = sqrt(a^2 + b^2)，cosθ = a/r，sinθ = -b/r
+      // 也就是说，这个旋转把b变为0，同时把a变为r，旋转矩阵G是一个2x2的正交矩阵
+      tempHo_GR.makeGivens(H_f(m - 1, n), H_f(m, n)); // 对 (m-1, n) 和 (m, n) 这两个元素构造 Givens 旋转
       // Multiply G to the corresponding lines (m-1,m) in each matrix
       // Note: we only apply G to the nonzero cols [n:Ho.cols()-n-1], while
       //       it is equivalent to applying G to the entire cols [0:Ho.cols()-1].
+      // 应用旋转到三个矩阵的相应行
+      // 对当前矩阵(如H_f)的第 m-1 行和第 m 行左乘旋转矩阵(的共轭转置)。
+      // 由于makeGivens构造的旋转矩阵通常为G = [[c, s], [-s, c]]，它的共轭转置是G^T = [[c, -s], [s, c]]
+      // 这正好是保证消元方向正确所需要的
+      // 为什么对Hf只从第n列开始应用旋转？因为前n-1列已经被消元为上三角了，如果再对它们应用新的旋转，会破坏已经置零的结构，
+      // 而从第 n 列开始应用，可以保证新的旋转只影响当前列及之后的列，不会影响已完成的列;
+      // 实际上，由于我们只关心消元，对前 n 列不做变化，它们已满足上三角
+      // 为什么对 Hx 和 res 是从整列（第 0 列）开始?
+      // 因为这两个矩阵没有类似 H_f 的上三角结构，必须将完整的旋转变换作用到它们的所有列，以保持整个增广矩阵的正交变换一致性。
       (H_f.block(m - 1, n, 2, H_f.cols() - n)).applyOnTheLeft(0, 1, tempHo_GR.adjoint());
       (H_x.block(m - 1, 0, 2, H_x.cols())).applyOnTheLeft(0, 1, tempHo_GR.adjoint());
       (res.block(m - 1, 0, 2, 1)).applyOnTheLeft(0, 1, tempHo_GR.adjoint());
     }
   }
+  // 执行完所有循环后 Hf 被变换为[R; 0]的形式，其中R是上三角矩阵，0是零矩阵。此时Hf的下方部分已经被消掉。
+  // 此时，Hx和res也被同样的正交变换旋转为 Hx' = Q^T Hx, res' = Q^T res，其中Q是由所有Givens旋转组成的正交矩阵。
+  // 此时，我们可以将增广矩阵分块: 
+  // 上半部分(前n行): 对应Hf的行空间，包含特征点信息。这部分数据与特征点有关，在不知道精确特征点时不可靠。
+  // 下半部分(后2m-n行): 对应Hf的左零空间，因为Hf'的下半部分是零矩阵，所以这部分数据与特征点无关，可以用于状态更新。
 
   // The H_f jacobian max rank is 3 if it is a 3d position, thus size of the left nullspace is Hf.rows()-3
   // NOTE: need to eigen3 eval here since this experiences aliasing!
   // H_f = H_f.block(H_f.cols(),0,H_f.rows()-H_f.cols(),H_f.cols()).eval();
+  // 只保留底部 rows-cols 行
   H_x = H_x.block(H_f.cols(), 0, H_x.rows() - H_f.cols(), H_x.cols()).eval();
   res = res.block(H_f.cols(), 0, res.rows() - H_f.cols(), res.cols()).eval();
 
