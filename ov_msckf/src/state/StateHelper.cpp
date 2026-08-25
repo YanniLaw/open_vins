@@ -129,6 +129,15 @@ void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector
   }
 }
 
+/**
+ * @brief Perform an EKF update step.
+ *
+ * @param state The current state to be updated.完整的误差卡尔曼滤波状态
+ * @param H_order The order of the measurement variables.每列块对应的状态变量列表
+ * @param H The measurement Jacobian matrix.压缩后的测量矩阵
+ * @param res The measurement residual vector.压缩后的残差向量
+ * @param R The measurement noise covariance matrix.测量噪声协方差矩阵
+ */
 void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order, const Eigen::MatrixXd &H,
                             const Eigen::VectorXd &res, const Eigen::MatrixXd &R) {
 
@@ -137,11 +146,12 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
   // Part of the Kalman Gain K = (P*H^T)*S^{-1} = M*S^{-1}
   assert(res.rows() == R.rows());
   assert(H.rows() == res.rows());
+  // 预计算 M = P*H^T，P 是全局协方差矩阵，H 是压缩后的测量矩阵
   Eigen::MatrixXd M_a = Eigen::MatrixXd::Zero(state->_Cov.rows(), res.rows());
 
   // Get the location in small jacobian for each measuring variable
   int current_it = 0;
-  std::vector<int> H_id;
+  std::vector<int> H_id;   // 计算每一个state block在小jacobian中的位置，建立 H_order → H 中列偏移 的映射
   for (const auto &meas_var : H_order) {
     H_id.push_back(current_it);
     current_it += meas_var->size();
@@ -150,6 +160,20 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
   //==========================================================
   //==========================================================
   // For each active variable find its M = P*H^T
+  // 一般来说，H并不是一个包含了完整的状态宽度的矩阵，而是只包含了参与当前观测的状态变量。
+  // 在计算M的时候，其实一般做法是将H扩展为一个完整的状态宽度矩阵（其余列补零），然后计算M = P * H^T。
+  // 但是 Mi = ∑_j P_{ij} * H_j^T，其中 j 只遍历参与观测的状态变量，因此可以直接用协方差矩阵中对应的块来计算，而不需要扩展 H。
+  // 也就是说，M 的每一行对应一个状态变量，每一列对应一个观测残差，而 M 的每一行只需要累加它对所有观测状态块的贡献。
+  // 这样做的好处是节省了内存和计算，因为不需要构造一个完整的稀疏矩阵 H，而是直接利用协方差矩阵中的块来计算 M。
+  // 具体来说，对于每一个状态变量 var，它对 M 的贡献是 ∑_i P_{var, H_order[i]} * H_{*，i}^⊤ —— 只用协方差中"该状态 × 量测状态"那一小块，其他块乘出来也是 0，直接跳过。
+  // H_id[i] 记录了第 i 个量测状态在 H 里的起始列，和之前 get_feature_jacobian_full 的 map_hx、 UpdaterMSCKF 的 Hx_mapping 是同一套"列-状态记账"
+  // ================================
+  // 对每个状态变量 var，累加它对所有量测状态块的贡献
+  // M=PH^⊤的行覆盖所有状态，但列只涉及 H_order 里的状态
+  // 对每个状态 var，它对 M 的贡献是 ∑_i P_{var, H_order[i]} * H_{*，i}^⊤ —— 只用协方差中"该状态 × 量测状态"那一小块，其他块乘出来也是 0，直接跳过
+  // H_id[i] 记录了第 i 个量测状态在 H 里的起始列，和之前 get_feature_jacobian_full 的 map_hx、UpdaterMSCKF 的 Hx_mapping 是同一套"列-状态记账"逻辑的延续。
+  // 结果 M_a 是一个"行覆盖所有状态、列覆盖量测状态"的矩阵，后续用它和 S^{-1} 相乘得到 Kalman 增益 K。
+  // Ma = P*H^⊤ (尺寸为 N_state × N_res) -> M^T = HP
   for (const auto &var : state->_variables) {
     // Sum up effect of each subjacobian = K_i= \sum_m (P_im Hm^T)
     Eigen::MatrixXd M_i = Eigen::MatrixXd::Zero(var->size(), res.rows());
@@ -160,27 +184,48 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
     }
     M_a.block(var->id(), 0, var->size(), res.rows()) = M_i;
   }
+  // 为什么没被观测的状态也会更新?
+  // EKF 更新不是只更新观测方程中显式出现的变量，而是通过 covariance cross-correlation 更新整个相关状态
 
   //==========================================================
   //==========================================================
   // Get covariance of the involved terms
+  // 从完整 covariance 中抽出 measurement 涉及变量对应的 covariance
   Eigen::MatrixXd P_small = StateHelper::get_marginal_covariance(state, H_order);
 
   // Residual covariance S = H*Cov*H' + R
+  // 计算新息协方差
+  // 为什么只写入上三角？因为 S 是对称矩阵，写入上三角就够了，节省计算和内存。
   Eigen::MatrixXd S(R.rows(), R.rows());
   S.triangularView<Eigen::Upper>() = H * P_small * H.transpose();
-  S.triangularView<Eigen::Upper>() += R;
+  S.triangularView<Eigen::Upper>() += R; // 只将这个结果矩阵的上三角部分（Upper Triangle）写入 S
   // Eigen::MatrixXd S = H * P_small * H.transpose() + R;
 
   // Invert our S (should we use a more stable method here??)
+  // 如果不需要求逆，可以直接用 K = llt.solve(M_a.transpose()).transpose(); 一步求取卡尔曼增益
+  // 用 Cholesky 分解求逆，避免直接求逆带来的数值不稳定性。S 是对称正定矩阵，适合用 Cholesky 分解。
+  // llt() 是 Eigen 提供的 Cholesky 分解方法，S = LL^T (S是对称正定矩阵)
+  // solveInPlace() 求解S*X = I (即对单位阵逐列求解)，结果X = S^-1直接写回Sinv。是在原地求解线性方程组，避免了额外的内存开销。
+  // 好处：稳定、快，且是原地操作，不额外分配大矩阵
   Eigen::MatrixXd Sinv = Eigen::MatrixXd::Identity(R.rows(), R.rows());
   S.selfadjointView<Eigen::Upper>().llt().solveInPlace(Sinv);
-  Eigen::MatrixXd K = M_a * Sinv.selfadjointView<Eigen::Upper>();
+  // Sinv是对称矩阵，仍然用 selfadjointView<Eigen::Upper>() 来读取上半部分
+  Eigen::MatrixXd K = M_a * Sinv.selfadjointView<Eigen::Upper>(); // 组装卡尔曼增益 
   // Eigen::MatrixXd K = M_a * S.inverse();
 
   // Update Covariance
+  // 更新协方差矩阵 P ,标准形式 P+ = (I - K*H)*P'
+  // Joseph 稳定形式（对称保持形式） P+ = (I - K*H)*P'*(I - K*H)^T + K*R*K^T
+  // 本质上是把(I-KH)平方了一下，再加上测量噪声项，确保了数值稳定性和对称性，但是计算量是标准形式的3倍
+  // 还有一种方法，平方根/因式分解更新(数值黄金标准)，不直接更新P矩阵，而是更新协方差的 Cholesky 因子(即下三角矩阵L，满足P = LL^T)，
+  // 这种方法始终保持 P 为正定矩阵，甚至能处理条件数极差的病态矩阵，数值稳定性最好，但实现复杂，计算量也大。
+  // 本文用的方法是简化形式的EKF协方差更新，在增益取最优时与 Joseph 形式等价，数值稳定性略差于Joseph但计算量小很多。
+  // 它的核心是利用了 M_a = P*H^T，S = H*P*H^T + R，最终更新公式可以简化为 P+ = P - K*M_a^T。
+  //  KM^T = M*S^{-1}*M^T = PH^T*S^{-1}*H*P = KSK^T
+  // 由于Ma = PH^T, 则Ma^T = HP, 所以 K*M_a^T = K*HP 
+  // 因此 P = P - KHP = P - PH^T(HPH^T+R)^{-1}HP = P - PH^TS^{-1}HP = P - KSK^T
   state->_Cov.triangularView<Eigen::Upper>() -= K * M_a.transpose();
-  state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>();
+  state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>(); // 同样只保留上三角，保证对称性
   // Cov -= K * M_a.transpose();
   // Cov = 0.5*(Cov+Cov.transpose());
 
@@ -198,8 +243,11 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
   }
 
   // Calculate our delta and update all our active states
-  Eigen::VectorXd dx = K * res;
+  // dx 的布局和协方差/状态向量完全一致：每个状态变量在 dx 中占据 [id, id+size)
+  Eigen::VectorXd dx = K * res; // 计算误差状态修正量
   for (size_t i = 0; i < state->_variables.size(); i++) {
+    // 更新每个状态变量的值，dx.block(...) 提取出对应状态变量的误差修正量
+    // 每个变量的 update() 会按自身类型处理
     state->_variables.at(i)->update(dx.block(state->_variables.at(i)->id(), 0, state->_variables.at(i)->size(), 1));
   }
 

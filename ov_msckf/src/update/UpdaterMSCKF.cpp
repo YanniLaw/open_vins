@@ -179,11 +179,11 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   // Large Jacobian and residual of *all* features for this update
   // 预分配大矩阵 + 记账结构
   Eigen::VectorXd res_big = Eigen::VectorXd::Zero(max_meas_size);
-  Eigen::MatrixXd Hx_big = Eigen::MatrixXd::Zero(max_meas_size, max_hx_size);
+  Eigen::MatrixXd Hx_big = Eigen::MatrixXd::Zero(max_meas_size, max_hx_size); // 该状态在大矩阵里的起始列（跨特征共享）
   std::unordered_map<std::shared_ptr<Type>, size_t> Hx_mapping; // 状态类型 → 列偏移
   std::vector<std::shared_ptr<Type>> Hx_order_big; // 状态类型的有序列表
-  size_t ct_jacob = 0; // 已登记的状态列数
-  size_t ct_meas = 0;  // 已填入的测量行数
+  size_t ct_jacob = 0; // 已登记的状态总列数
+  size_t ct_meas = 0;  // 已填入的测量行数(残差累计长度)
 
   // 4. Compute linear system for each feature, nullspace project, and reject
   auto it2 = feature_vec.begin();
@@ -217,7 +217,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     Eigen::MatrixXd H_f; // 残差对特征点的雅可比矩阵 2m x 3(或2m x 1)
     Eigen::MatrixXd H_x; // 残差对状态的雅可比矩阵   2m x 状态维数
     Eigen::VectorXd res; // 残差向量(重投影)        2m x 1 
-    std::vector<std::shared_ptr<Type>> Hx_order;
+    std::vector<std::shared_ptr<Type>> Hx_order; // 记录当前Hx矩阵每一列块对应哪个状态对象(标定状态，IMU克隆状态)
 
     // Get the Jacobian for this feature
     UpdaterHelper::get_feature_jacobian_full(state, feat, H_f, H_x, res, Hx_order);
@@ -226,14 +226,50 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     // 经过零空间投影后，H_f 被消掉，H_x 和 res 被变换为 Hx' = Q^T Hx, res' = Q^T res，其中 Q 是由所有 Givens 旋转组成的正交矩阵。
     UpdaterHelper::nullspace_project_inplace(H_f, H_x, res);
 
-    /// Chi2 distance check
-    Eigen::MatrixXd P_marg = StateHelper::get_marginal_covariance(state, Hx_order); // 获取当前特征观测涉及的状态的边缘协方差矩阵
+    /// Chi2 distance check 卡方距离检验
+    // 每个特征经过三角化、构造雅可比、零空间投影后，会得到一个残差向量r。这一步要问一个问题："这个残差，大到离谱了吗？" 
+    // 如果大到用噪声模型都解释不了（马氏距离超限），就认为它是外点（动态物体、误匹配、三角化炸了），直接删掉，不参与状态更新。
+    // 为什么需要它？
+    // MSCKF 每次会喂进来几十上百个特征。其中必然混着:
+    // 1. 动态物体上的特征点（比如车牌、行人、车灯）
+    // 2. 误匹配的特征点（比如误匹配到了背景的纹理） 
+    // 3. 在特征边缘、深度退化处三角化出的病态点（比如观测点共线、视差太小）
+    // 这些都会导致三角化出来的 3D 点会在不同帧之间跳来跳去，导致残差加大；
+    // 如果把这些垃圾特征也丢进 EKF 更新，会污染状态估计。所以需要在更新前，
+    // 用统计学方法把"残差异常大"的特征筛掉——这就是 RANSAC 之外另一种经典的**门控（gating）**手段。
+    /* 马氏距离 = "以噪声标准差为单位"的残差
+    普通欧氏距离 ||r||_2 = sqrt(r^T r) 只考虑了残差的大小，没有考虑噪声协方差 S 的影响。
+    由于残差不同分量的不确定度不一样（有的方向噪声大、有的小），所以要用马氏距离，它把残差"除以不确定度"再求模
+    马氏距离 d = r^T*S^-1*r 考虑了噪声协方差 S 的影响，S 是残差 r 的协方差
+    直观理解：它量的是"这个残差相当于多少个标准差的异常"。r的每个分量被S 归一化后，d2是个无量纲的"离谱程度"
+    马氏距离的平方服从卡方分布
+    如果这个特征是"好"的（残差确实服从 N(0,S)），那么 chi2 = r^T * S^-1 * r 服从自由度为残差维度 res.rows() 的卡方分布。
+    所以对每个特征我们能算出"正常范围"：
+    - 95% 分位点: 好的特征有 95% 的概率落在这个范围内，5% 的概率落在外面
+    - 如果 chi2 > 95%分位点，那只有 5% 的可能它是好的 → 更合理的解释是它是外点 → 剔除
+    note： 为什么自由度是残差维度res.rows()？因为残差是高斯噪声下的随机变量，残差维度就是它的自由度。
+    自由度 = 残差里独立分量的个数
+    零空间投影前:一个特征有m个观测点，每个观测点有(u,v)两个分量 → 残差维度 = 2m
+    零空间投影后:每个特征的残差维度从 2m 减到 2m−3（因为投影掉了3个自由度） → 自由度 = 2m−3
+    又由于res.rows()已经是投影后的行数，所以天然就是自由度，代码直接用res.rows()查表/算分位点。
+    */
+    Eigen::MatrixXd P_marg = StateHelper::get_marginal_covariance(state, Hx_order); // 获取当前特征观测涉及的状态(IMU克隆，标定状态)的边缘协方差矩阵
+    // 状态不确定性投影到测量空间 —— 把状态协方差"穿过"测量雅可比Hx，变成残差空间里的协方差
     Eigen::MatrixXd S = H_x * P_marg * H_x.transpose();
-    // 构造投影后量测的新息协方差 S = H_x * P_marg * H_x^T + σ_pix^2 * I，其中 σ_pix^2 * I 是像素噪声协方差
-    // 注意： 零空间投影用的是正交矩阵Q2， 所以噪声仍是 isotropic的，投影后仍然是 σ_pix^2 * I，直接加在 S 的对角线上是正确的。
+    // 构造投影后量测的新息协方差 S = H_x * P_marg * H_x^T + σ_pix^2 * I，其中 R = σ_pix^2 * I 是像素噪声协方差
+    // 注意： 零空间投影用的是正交矩阵Q2(Givens 旋转)，它不改变白噪声的性质。即各向同性白噪声经过正交变换后仍是各向同性白噪声、方差不变。
+    // 所以噪声仍是 isotropic的，投影后 R 仍然是 σ_pix^2 * I，直接加在 S 的对角线上是正确的。
     S.diagonal() += _options.sigma_pix_sq * Eigen::VectorXd::Ones(S.rows());
-    // 计算卡方统计量 chi2 = res^T * S^-1 * res  等于马氏距离平方
-    // 用 Cholesky 分解(S.llt().solve(res))求解线性方程 S * x = res，得到 x = S^-1 * res，然后再点乘 res 得到 chi2
+    // 计算马氏距离平方，数学上等价于卡方统计量 chi2 = r^T * S^-1 * r，但不直接求逆S^-1(数值上慢且不稳定)，
+    // 这里用 Cholesky 分解：
+    // 1. S.llt()把S分解为下三角矩阵L和其转置L^T，满足 S = L * L^T
+    // 2. S.llt().solve(res)求解线性方程 S * x = r，得到 x = S^-1 * r
+    // 3. res.dot(S.llt().solve(res)) 就是 r^T * S^-1 * r，
+    // 也就是马氏距离平方，即所需要的卡方统计量 chi2
+    // 解释：马氏距离是统计学中衡量一个点与分布中心的距离，考虑了协方差。对于高斯分布，马氏距离平方服从卡方分布。
+    // 这里的残差 r 是高斯噪声下的随机变量，S 是它的协方差矩阵，所以 r^T S^-1 r  
+    // 服从卡方分布，卡方检验就是用这个统计量来判断观测是否异常。
+    // 具体公式参考 https://docs.openvins.com/update-feat.html#chi2-check
     double chi2 = res.dot(S.llt().solve(res));
     // 此时残差维度为2m-3，S是2m-3 x 2m-3的矩阵，chi2是标量。 自由度就是res.rows()
 
@@ -260,44 +296,59 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     }
 
     // We are good!!! Append to our large H vector
-    size_t ct_hx = 0;
-    for (const auto &var : Hx_order) {
+    size_t ct_hx = 0; // 当前特征 H_x 内部的"列游标"(当前状态快在本特征内的起始列索引)
+    for (const auto &var : Hx_order) { // 按顺序遍历该特征的每个状态块
 
       // Ensure that this variable is in our Jacobian
+      // 全局去重：这个状态第一次出现才在大矩阵里分配列
+      // 因为同一个状态（比如某个 IMU 克隆）会被很多特征同时观测到。
+      // 第一个遇到它的特征负责在 Hx_big 里分配列；后面所有特征都通过 Hx_mapping 找到同一列往里填。这样最终 
+      // Hx_big 的每一列都只对应一个状态，且 Hx_order_big 记录了这个对应关系，供最后的 EKFUpdate 使用
+      // note: Hx_big 的行就是所有好特征的残差堆叠（每一行对应某特征某观测的一个 u 或 v 分量），列是所有涉及状态的总维数
       if (Hx_mapping.find(var) == Hx_mapping.end()) {
-        Hx_mapping.insert({var, ct_jacob});
-        Hx_order_big.push_back(var);
-        ct_jacob += var->size();
+        Hx_mapping.insert({var, ct_jacob}); // 状态 → 全局起始列
+        Hx_order_big.push_back(var);        // 记入全局顺序表
+        ct_jacob += var->size();            // 推进全局列计数
       }
 
       // Append to our large Jacobian
+      // 把这块从"单特征 H_x"拷进"全局 Hx_big"
+      // Hx_big是列共享，行堆叠结构: 同一个状态（列）被多个特征观测，就在不同行各写一段自己的方程块。
+      // ct_meas 保证每个特征的行区间互不重叠，因此后拷贝的特征不会覆盖前面的，
+      // 反而正是靠这种堆叠把多个特征的观测约束融合进同一个 EKF 更新。
+      // 真正的"同一状态写同一块"只在单特征内部出现，而那已经在 get_feature_jacobian_full 里用 += 合并好了
       Hx_big.block(ct_meas, Hx_mapping[var], H_x.rows(), var->size()) = H_x.block(0, ct_hx, H_x.rows(), var->size());
-      ct_hx += var->size();
+      ct_hx += var->size(); // 推进单特征列游标
     }
 
     // Append our residual and move forward
+    // 残差也一样拷贝进去
     res_big.block(ct_meas, 0, res.rows(), 1) = res;
-    ct_meas += res.rows();
+    ct_meas += res.rows();  // 推进全局行计数
     it2++;
   }
   rT3 = boost::posix_time::microsec_clock::local_time();
 
   // We have appended all features to our Hx_big, res_big
   // Delete it so we do not reuse information
+  // 用完即弃
   for (size_t f = 0; f < feature_vec.size(); f++) {
     feature_vec[f]->to_delete = true;
   }
 
   // Return if we don't have anything and resize our matrices
+  // 收缩矩阵到实际大小 + 保护判断
   if (ct_meas < 1) {
     return;
   }
   assert(ct_meas <= max_meas_size);
   assert(ct_jacob <= max_hx_size);
+  // 开头预分配的max_meas_size/max_hx_size 是上界（卡方剔除 + 零空间投影会让行数变少、去重会让列数变少）。
+  // 现在用 conservativeResize 把矩阵裁剪到真实尺寸，省内存也让后续计算维度正确。
   res_big.conservativeResize(ct_meas, 1);
   Hx_big.conservativeResize(ct_meas, ct_jacob);
 
-  // 5. Perform measurement compression
+  // 5. Perform measurement compression 测量压缩
   UpdaterHelper::measurement_compress_inplace(Hx_big, res_big);
   if (Hx_big.rows() < 1) {
     return;
@@ -305,6 +356,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   rT4 = boost::posix_time::microsec_clock::local_time();
 
   // Our noise is isotropic, so make it here after our compression
+  // 压缩用的是正交变换，各向同性噪声保持不变，所以 R 仍是σ_pix^2*I，直接按压缩后的行数构造即可
   Eigen::MatrixXd R_big = _options.sigma_pix_sq * Eigen::MatrixXd::Identity(res_big.rows(), res_big.rows());
 
   // 6. With all good features update the state

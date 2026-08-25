@@ -620,9 +620,51 @@ void UpdaterHelper::nullspace_project_inplace(Eigen::MatrixXd &H_f, Eigen::Matri
   assert(H_x.rows() == res.rows());
 }
 
+/* 零空间投影 和 测量压缩 的区别: 
+1.作用对象: 
+  - 零空间投影: 作用于特征点误差的雅可比 H_f，将其消掉，只保留对状态误差的约束。
+  - 测量压缩: 作用于观测对状态误差的雅可比 H_x 和残差 res，将其行数压缩到最多等于状态维数。
+2.目的:
+  - 零空间投影: 把特征点误差从方程里面删除，使得更新只依赖于状态误差。
+  - 测量压缩: 把冗余行压缩掉，减少计算量和内存占用，提高EKF更新的效率，同时保持信息量不变。
+3. H矩阵特征:
+  - 零空间投影: H_f 是一个 2m x 3(或1) 的矩阵，m是该特征的总观测次数，表示残差对特征误差的雅可比。
+  - 测量压缩: H_x 是一个 2m x 状态维数 的矩阵，表示残差对状态误差的雅可比。
+3.零空:
+  - 零空间投影: 消完后留下下面的零空间行。 
+  - 测量压缩: 消完后留下上面的三角行。 
+4.维度变化:
+  - 零空间投影: 行数2m→2m−3。
+  - 测量压缩: 行数：2m→min(2m,n)。
+两者共用同一套 Givens 消元机器，只是"保留哪一半"不同：零空间投影留下底部（与特征无关的约束），压缩留下顶部（上三角的独立约束）
+*/
+
+/**
+ * @brief Compress the measurement Jacobian and residual using Givens rotations.
+ * 这个函数用 Givens 正交旋转把"上千行残差"无损压缩到"最多状态维数"，把 EKF 更新里那个要反复求逆的大矩阵从千维缩到几十维
+ * 由于上一步Hx_big等拼接完所有好特征后，Hx是一个"又高又瘦"的矩阵（行数 = 上千个残差，列数 = 几十个状态）。
+ * 这个函数用正交旋转把它的行数压到最多等于状态维数，而信息量完全不变——因为 EKF 更新其实只需要这么多独立约束。
+ * 本质上是在 MSCKF 已经通过零空间投影消掉特征点状态以后，再对“大量视觉残差”做一次 QR 型测量压缩
+ * 很多条residual -> 最多和状态维度一样多的独立约束，剩下的都是冗余约束，压缩掉就行了
+ * 它不是简单丢测量，也不是降采样，而是在高斯线性模型下把对状态有用的信息完整保留下来，把那些落在 Hx左零空间里的纯噪声方向丢掉
+ * 零空间投影后，特征已经不再出现在状态里
+ * r = Hx*δx + n 其中Hx mxn r mx1 n~N(0,sigma^2*I)
+ * 对Hx做QR分解，得到Hx = Q [R; 0]，其中R是上三角矩阵，0是零矩阵 Q=[Q1 Q2]
+ * 又因为Q是正交矩阵，有Q^TQ=I；所以Hx = [Q1 Q2][R; 0] = Q1 R 所以有 Q1^T*Hx = R，Q2^T*Hx = 0
+ * 左乘Q^T，得到 Q^T r = Q^T Hx δx + Q^T n = [R; 0] δx + Q^T n
+ * 展开 [Q1^T*r] = [R] δx + [Q1^T*n]
+ *     [Q2^T*r]   [0]       [Q2^T*n]
+ * 第一部分 r1 = R δx + n1，n1 ~ N(0,sigma^2*I) 
+ * 第二部分 r2 = 0 δx + n2，n2 ~ N(0,sigma^2*I),其中r2 = Q2^T*r，n2 = Q2^T*n
+ * 只保留上半部分，得到 r0 = R δx + n0，其中n0 ~ N(0,sigma^2*I)，r0 mx1，R mxn，m = min(2m, n)，n是状态维数
+ * 这样就把原始的2m维残差压缩到最多n维，信息量不变，EKF更新只需要用r0和R就行了
+ * @param H_x The measurement Jacobian matrix to be compressed.
+ * @param res The residual vector to be compressed.
+ */
 void UpdaterHelper::measurement_compress_inplace(Eigen::MatrixXd &H_x, Eigen::VectorXd &res) {
 
   // Return if H_x is a fat matrix (there is no need to compress in this case)
+  // 观测约束已经足够少，不需要压缩，直接返回。
   if (H_x.rows() <= H_x.cols())
     return;
 
@@ -631,14 +673,21 @@ void UpdaterHelper::measurement_compress_inplace(Eigen::MatrixXd &H_x, Eigen::Ve
   // See page 252, Algorithm 5.2.4 for how these two loops work
   // They use "matlab" index notation, thus we need to subtract 1 from all index
   Eigen::JacobiRotation<double> tempHo_GR;
-  for (int n = 0; n < H_x.cols(); n++) {
-    for (int m = (int)H_x.rows() - 1; m > n; m--) {
-      // Givens matrix G
+  for (int n = 0; n < H_x.cols(); n++) { // 逐列消元
+    for (int m = (int)H_x.rows() - 1; m > n; m--) { // 从最后一行往上
+      // Givens matrix G ，用 (m-1,n) 和 (m,n) 两个元素构造旋转，目的是把 (m,n) 消成 0
       tempHo_GR.makeGivens(H_x(m - 1, n), H_x(m, n));
       // Multiply G to the corresponding lines (m-1,m) in each matrix
       // Note: we only apply G to the nonzero cols [n:Ho.cols()-n-1], while
       //       it is equivalent to applying G to the entire cols [0:Ho.cols()-1].
+      // 最终 Hx变成上三角：前 n 行非零、其余全零
+      // 为什么 Hx只从第 n 列开始旋转，而 res 从第 0 列开始？
+      // Hx前 n−1 列已经完成消元、对角线以下全是 0（这正是我们想要的三角结构）。
+      // 如果对这些已完成列再施转，理论上等价（0 旋转还是 0），但没必要——从第 n 列开始即可，省计算。
+      // 而 res 没有这种结构约束，必须整列一起旋转，保证 Q 一致地作用在增广系统上。
+      // 把旋转作用到 H_x 的第 m-1、m 两行（从第 n 列开始）
       (H_x.block(m - 1, n, 2, H_x.cols() - n)).applyOnTheLeft(0, 1, tempHo_GR.adjoint());
+      // 同样的旋转作用到 res 的第 m-1、m 两行（整列）
       (res.block(m - 1, 0, 2, 1)).applyOnTheLeft(0, 1, tempHo_GR.adjoint());
     }
   }
@@ -649,6 +698,6 @@ void UpdaterHelper::measurement_compress_inplace(Eigen::MatrixXd &H_x, Eigen::Ve
 
   // Construct the smaller jacobian and residual after measurement compression
   assert(r <= H_x.rows());
-  H_x.conservativeResize(r, H_x.cols());
+  H_x.conservativeResize(r, H_x.cols()); // 丢掉下方全部为零的行，只保留前 r 行
   res.conservativeResize(r, res.cols());
 }
