@@ -556,11 +556,38 @@ std::shared_ptr<Type> StateHelper::clone(std::shared_ptr<State> state, std::shar
   return new_clone;
 }
 
+/**
+ * @brief Initialize a new variable in the state with a given measurement model and noise
+ * 给定一批观测到"新路标"的量测，用 Givens 正交旋转把线性系统一分为二： 
+ * 上半部分用来初始化路标（均值 + 协方差 + 与已有状态的交叉项），下半部分用来对已有状态做一次 EKF 更新
+ * 线性化后的初始测量模型为：
+ * r = H_R * x + H_L * f + n, n ~ N(0, R)
+ * 其中 r 是残差，x 是已有状态，f 是新路标，n 是测量噪声，R 是噪声协方差矩阵
+ * 我们需要做两件事情：
+ * 1.求出新路标的最优估计f^及其协方差P_ff和与已有状态的交叉协方差P_xf
+ * 2.利用不依赖路标的那部分信息顺便更新已有状态
+ * 难点:
+ * H_L是高瘦矩阵(2mx3)，不能直接求逆，所以先用正交旋转把它变为"上半可逆，下半为零"
+ * 通过 Givens QR 分解把 H_f 变为上三角
+ * 1. 上半部分: H_finit * f + H_xinit * x = rinit, 用来初始化新路标 f
+ * 2. 下半部分: H_up * x = r_up, 用来对已有状态 x 做一次 EKF 更新
+ * @param state 
+ * @param new_variable landmark
+ * @param H_order 与该new_variable相关的状态变量列表，顺序与 H_R/H_L 中的列对应
+ * @param H_R H_x 观测相对相关状态变量的雅可比矩阵
+ * @param H_L H_f 观测相对路标变量的雅可比矩阵
+ * @param R 噪声协方差矩阵
+ * @param res 残差向量
+ * @param chi_2_mult 卡方检测阈值倍数，通常取 1.0~3.0，越大越宽松
+ * @return true 
+ * @return false 
+ */
 bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type> new_variable,
                              const std::vector<std::shared_ptr<Type>> &H_order, Eigen::MatrixXd &H_R, Eigen::MatrixXd &H_L,
                              Eigen::MatrixXd &R, Eigen::VectorXd &res, double chi_2_mult) {
 
   // Check that this new variable is not already initialized
+  // 该路标已经在状态向量中存在，说明重复初始化了
   if (std::find(state->_variables.begin(), state->_variables.end(), new_variable) != state->_variables.end()) {
     PRINT_ERROR("StateHelper::initialize_invertible() - Called on variable that is already in the state\n");
     PRINT_ERROR("StateHelper::initialize_invertible() - Found this variable at %d in covariance\n", new_variable->id());
@@ -571,6 +598,7 @@ bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type>
   // TODO: can we simplify this so it doesn't take as much time?
   assert(R.rows() == R.cols());
   assert(R.rows() > 0);
+  // 噪声必须是各向同性（对角线同值、非对角线为零）
   for (int r = 0; r < R.rows(); r++) {
     for (int c = 0; c < R.cols(); c++) {
       if (r == c && R(0, 0) != R(r, c)) {
@@ -589,17 +617,24 @@ bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type>
   //==========================================================
   // First we perform QR givens to seperate the system
   // The top will be a system that depends on the new state, while the bottom does not
-  size_t new_var_size = new_variable->size();
-  assert((int)new_var_size == H_L.cols());
+  size_t new_var_size = new_variable->size(); // 路标的维度(三维或者一维)
+  assert((int)new_var_size == H_L.cols()); // 检查观测对路标的雅可比矩阵列数是否与路标维度一致
 
+  // 这里实质上构造了一个全局正交旋转矩阵 Q(由一系列 Givens 旋转连乘而成)，使得: 
+  // Q[H_L; H_R; res] = [R_L, H_R,1, res1] 
+  //                    [0,   H_R,2, res2]，
+  // 其中 R_L 是上三角矩阵，H_R,1/H_R,2 分别是上半部分/下半部分的 H_R
+  // 也就是把原来的线性系统分为两部分：上半部分用来初始化新路标，下半部分用来对已有状态做一次 EKF 更新
   Eigen::JacobiRotation<double> tempHo_GR;
   for (int n = 0; n < H_L.cols(); ++n) {
-    for (int m = (int)H_L.rows() - 1; m > n; m--) {
+    for (int m = (int)H_L.rows() - 1; m > n; m--) { // 自下而上，逐行消元
       // Givens matrix G
+      //计算一个 2x2 的 Givens 正交旋转矩阵，将向量[H_L(m - 1, n), H_L(m, n)]中的 H_L(m, n) 被消为 0
       tempHo_GR.makeGivens(H_L(m - 1, n), H_L(m, n));
       // Multiply G to the corresponding lines (m-1,m) in each matrix
       // Note: we only apply G to the nonzero cols [n:Ho.cols()-n-1], while
       //       it is equivalent to applying G to the entire cols [0:Ho.cols()-1].
+      // 同步行变换(左乘G^T)
       (H_L.block(m - 1, n, 2, H_L.cols() - n)).applyOnTheLeft(0, 1, tempHo_GR.adjoint());
       (res.block(m - 1, 0, 2, 1)).applyOnTheLeft(0, 1, tempHo_GR.adjoint());
       (H_R.block(m - 1, 0, 2, H_R.cols())).applyOnTheLeft(0, 1, tempHo_GR.adjoint());
@@ -607,13 +642,19 @@ bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type>
   }
 
   // Separate into initializing and updating portions
+  // 这里将观测拆成两个子系统
+  // 原方程 r = Hx * δx + Hf * δf + n，分解后变为：
+  // [r_init] = [H_xinit] * δx + [H_finit] * δf + n_init
+  // [r_up  ] = [H_up   ]      + [0      ]      + n_up
   // 1. Invertible initializing system
+  // 上半部（含路标，可逆）→ 用于初始化路标
   Eigen::MatrixXd Hxinit = H_R.block(0, 0, new_var_size, H_R.cols());
   Eigen::MatrixXd H_finit = H_L.block(0, 0, new_var_size, new_var_size);
   Eigen::VectorXd resinit = res.block(0, 0, new_var_size, 1);
   Eigen::MatrixXd Rinit = R.block(0, 0, new_var_size, new_var_size);
 
   // 2. Nullspace projected updating system
+  // 下半部（无路标）→ 用于更新已有状态
   Eigen::MatrixXd Hup = H_R.block(new_var_size, 0, H_R.rows() - new_var_size, H_R.cols());
   Eigen::VectorXd resup = res.block(new_var_size, 0, res.rows() - new_var_size, 1);
   Eigen::MatrixXd Rup = R.block(new_var_size, new_var_size, R.rows() - new_var_size, R.rows() - new_var_size);
@@ -622,6 +663,7 @@ bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type>
   //==========================================================
 
   // Do mahalanobis distance testing
+  // 对下半部残差做卡方检验，防止异常值影响已有状态的更新
   Eigen::MatrixXd P_up = get_marginal_covariance(state, H_order);
   assert(Rup.rows() == Hup.rows());
   assert(Hup.cols() == P_up.cols());
@@ -629,6 +671,7 @@ bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type>
   double chi2 = resup.dot(S.llt().solve(resup));
 
   // Get what our threshold should be
+  // 用不依赖路标的下半部做检验：如果这部分残差都大到离谱，说明该特征初始化不可靠，直接拒绝
   boost::math::chi_squared chi_squared_dist(res.rows());
   double chi2_check = boost::math::quantile(chi_squared_dist, 0.95);
   if (chi2 > chi_2_mult * chi2_check) {
@@ -637,21 +680,51 @@ bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type>
 
   //==========================================================
   //==========================================================
-  // Finally, initialize it in our state
+  // Finally, initialize it in our state 用上半部分初始化路标
   StateHelper::initialize_invertible(state, new_variable, H_order, Hxinit, H_finit, Rinit, resinit);
 
   // Update with updating portion
+  // initialization 后为什么还有一次 EKF update？
+  // 前面经过QR之后 r 分为上半部分的r_init(这部分拿来去初始化路标点了)与下半部分的r_up(完全不依赖于路标)
+  // 所以剩余的r_up也不能浪费，拿来继续更新我们的state,与msckf思想一致
   if (Hup.rows() > 0) {
-    StateHelper::EKFUpdate(state, H_order, Hup, resup, Rup);
+    StateHelper::EKFUpdate(state, H_order, Hup, resup, Rup);  // 用下半部分（不依赖路标）对已有状态做一次标准更新
   }
   return true;
 }
 
+/**
+ * @brief Initialize a new variable in the state using an invertible measurement model
+ * 现在初始化部分是:
+ * r_init = Hx*δx + Hf *δf + n 
+ * 由于经过QR后  Hf ∈ R_3x3，并且假设可逆
+ * 于是 δf = Hf^{-1}(r_init - Hx*δx -n)
+ * 也就是 δf = -Hf^{-1}*Hx*δx + Hf^{-1}*r_init - Hf^{-1}*n
+ * 可以将这个公式分为两部分:
+ * 1. Hf^{-1}*r_init 确定性部分，类似于均值
+ * 2. -Hf^{-1}*Hx*δx - Hf^{-1}*n  随机部分，类似于误差
+ * EKF随机变量传播里是均值和协方差分开处理，所以
+ * 协方差计算:
+ * δf = -Hf^{-1}*Hx*δx - Hf^{-1}*n
+ * 令A = -Hf^{-1}*Hx, B = -Hf^{-1}, 则 δf = A*δx + B*n
+ * 于是 P_ff = A*P_xx*A^T + B*R*B^T, P_xf = P_xx*A^T
+ * 其中 P_xx 是已有状态的协方差，R 是测量噪声协方差
+ * 所以 Pff = Hf^{-1}*Hx*P_xx*Hx^T*Hf^{-T} + Hf^{-1}*R*Hf^{-T}, P_xf = -P_xx*Hx^T*Hf^{-T}
+ * 也就是新路标的协方差和已有状态的交叉协方差
+ * @param state The current state
+ * @param new_variable The new variable to be initialized 路标
+ * @param H_order The order of variables in the measurement
+ * @param H_R The right part of the measurement matrix after QR decomposition 上半部分H_xinit
+ * @param H_L The left part of the measurement matrix after QR decomposition 上半部分H_finit
+ * @param R The measurement noise covariance 上半部分噪声
+ * @param res The measurement residual 上半部分残差
+ */
 void StateHelper::initialize_invertible(std::shared_ptr<State> state, std::shared_ptr<Type> new_variable,
                                         const std::vector<std::shared_ptr<Type>> &H_order, const Eigen::MatrixXd &H_R,
                                         const Eigen::MatrixXd &H_L, const Eigen::MatrixXd &R, const Eigen::VectorXd &res) {
 
   // Check that this new variable is not already initialized
+  // 重复初始化检查
   if (std::find(state->_variables.begin(), state->_variables.end(), new_variable) != state->_variables.end()) {
     PRINT_ERROR("StateHelper::initialize_invertible() - Called on variable that is already in the state\n");
     PRINT_ERROR("StateHelper::initialize_invertible() - Found this variable at %d in covariance\n", new_variable->id());
@@ -659,6 +732,7 @@ void StateHelper::initialize_invertible(std::shared_ptr<State> state, std::share
   }
 
   // Check that we have isotropic noise (i.e. is diagonal and all the same value)
+  // 各向同性噪声检查（对角线同值、非对角为零）
   // TODO: can we simplify this so it doesn't take as much time?
   assert(R.rows() == R.cols());
   assert(R.rows() > 0);
@@ -686,7 +760,7 @@ void StateHelper::initialize_invertible(std::shared_ptr<State> state, std::share
 
   // Get the location in small jacobian for each measuring variable
   int current_it = 0;
-  std::vector<int> H_id;
+  std::vector<int> H_id; // H_id: H_order → H_R 中列偏移
   for (const auto &meas_var : H_order) {
     H_id.push_back(current_it);
     current_it += meas_var->size();
@@ -695,6 +769,7 @@ void StateHelper::initialize_invertible(std::shared_ptr<State> state, std::share
   //==========================================================
   //==========================================================
   // For each active variable find its M = P*H^T
+  // M的行覆盖所有状态、列只涉及量测状态，按"状态块 × 量测状态块"稀疏累加
   for (const auto &var : state->_variables) {
     // Sum up effect of each subjacobian= K_i= \sum_m (P_im Hm^T)
     Eigen::MatrixXd M_i = Eigen::MatrixXd::Zero(var->size(), res.rows());
@@ -717,12 +792,29 @@ void StateHelper::initialize_invertible(std::shared_ptr<State> state, std::share
   M.triangularView<Eigen::Upper>() += R;
 
   // Covariance of the variable/landmark that will be initialized
-  assert(H_L.rows() == H_L.cols());
+  // 计算路标点的自有协方差 P_LL = H_L^{-1} * M * H_L^{-T}
+  // 为什么计算 landmark covariance 时忽略 residual 的 deterministic part？
+  // 因为协方差描述的是: 随机变量相对于均值的波动，而不是均值本身。
+  // 定义上 Pff = E[(δf - E[δf])(δf - E[δf])^T]，其中 E[δf] 是均值，(δf - E[δf]) 是零均值的随机变量
+  // 现在 δf = -H_L^{-1}*H_R*δx + H_L^{-1}*r - H_L^{-1}*n，
+  // 当前这次计算中残差 r 已经是一个确定的数值，他不是随机变量，所以H_L^{-1}*r 是一个确定量，记 c = H_L^{-1}*r
+  // 而随机部分记成 w = -H_L^{-1}*H_R*δx - H_L^{-1}*n，w是零均值的随机变量，E[w] = 0
+  // 那么 δf = c + w，又 E[w] = 0 则E[δf] = c + E[w] = c，所以 δf - E[δf] = c +w -c = w
+  // 所以Cov[δf] = Cov(w) = E[w w^T]，即Pff = H_L^{-1}*H_R*Pxx*H_R^T*H_L^{-T} + H_L^{-1}*R*H_L^{-T}
+  assert(H_L.rows() == H_L.cols()); // H_L 必须是方阵（且大小为路标维度 × 路标维度）
   assert(H_L.rows() == new_variable->size());
   Eigen::MatrixXd H_Linv = H_L.inverse();
   Eigen::MatrixXd P_LL = H_Linv * M.selfadjointView<Eigen::Upper>() * H_Linv.transpose();
 
   // Augment the covariance matrix
+  // 扩增协方差矩阵，增加新路标的协方差块和与已有状态的交叉协方差块
+  // Pnew = [ Pxx  Pxf ]
+  //        [ Pfx  Pff ]
+  // 这里为什么不能写成 Pnew = [Pxx  0]
+  //                        [0    Pff] 呢？
+  // 因为这样写的话就相当于告诉EKF滤波器新路标与已有camera pose状态是独立的，但是实际上landmark是由这些相机位姿三角化得到的。
+  // 所以新路标的协方差 Pff 与已有状态的交叉协方差 Pxf 不能为零，否则滤波器无法利用已有状态对新路标进行约束，导致初始化不准确。
+  // delayed initialization 最关键的并不是“三角化晚一点”，而是正确做 correlated state augmentation
   size_t oldSize = state->_Cov.rows();
   state->_Cov.conservativeResizeLike(Eigen::MatrixXd::Zero(oldSize + new_variable->size(), oldSize + new_variable->size()));
   state->_Cov.block(0, oldSize, oldSize, new_variable->size()).noalias() = -M_a * H_Linv.transpose();
@@ -731,6 +823,14 @@ void StateHelper::initialize_invertible(std::shared_ptr<State> state, std::share
 
   // Update the variable that will be initialized (invertible systems can only update the new variable).
   // However this update should be almost zero if we already used a conditional Gauss-Newton to solve for the initial estimate
+  // 更新新路标的状态值，使用 H_L 的逆乘以残差向量 res 得到最优估计增量
+  // δf = H_L^{-1} * res  → 这里计算的是条件均值 δf^ = E[δf] = H_L^{-1} * res
+  // 在EKF当前线性化点，E[δx] = 0, E[n] = 0, 所以只有res留下来
+  // 但是如果是真实的landmark error f^~,那就绝对不止跟r有关了，而是
+  // f^~ = Hf^{-1}*r -Hf^{-1}*Hx*x^~ - Hf^{-1}*n
+  // 而初始化完成、把 mean correction 吸收到 nominal state 以后，新的 zero-mean error 实际上变成
+  // f^~+ = -Hf^{-1}*Hx*x^~ - Hf^{-1}*n
+  // 所以它和 camera/IMU state uncertainty 的关系，完整地保存在 Pxf 里了
   new_variable->update(H_Linv * res);
 
   // Now collect results, and add it to the state variables

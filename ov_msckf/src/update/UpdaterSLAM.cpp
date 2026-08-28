@@ -58,6 +58,26 @@ UpdaterSLAM::UpdaterSLAM(UpdaterOptions &options_slam, UpdaterOptions &options_a
   }
 }
 
+/**
+ * @brief Perform delayed initialization of features
+ * delayed_init 是 SLAM 特征"转正"的仪式——把一批三角化好的候选特征，正式加入滤波器的状态向量（成为"路标"）。
+ * 一个特征被跟踪足够久、三角化足够好之后，调用 delayed_init 把它从"临时测量轨迹"升级成状态向量里的一个路标（带位置均值 + 协方差），
+ * 从此每帧都能用它约束未来位姿——这就是 MSCKF→SLAM 的"延迟初始化"。
+ * 为什么需要"延迟初始化"?
+ * 往状态向量里加一个新变量，不仅要它的初值，还必须有它跟其他状态之间的协方差（交叉项）。
+ * 一帧两帧的测量给不出可靠的协方差 → 所以必须"延迟"：等特征积累足够多观测、三角化稳定后再一次性初始化。这就是 delayed_init 存在的意义
+ *******************************
+ MSCKF特征与SLAM特征的区别：
+	                    MSCKF 特征	                      SLAM 特征
+1.进状态向量吗？	 不进，用完即弃（零空间投影消掉）	      进（加入 _features_SLAM）
+2.生命周期	            一帧用完就删	                  长期存活，直到被边缘化
+3.作用	              只约束当前这批克隆	           持续约束未来位姿（长期回环/漂移抑制）
+4.代价	                状态向量小	                     状态向量变大
+********************************
+ * @note 这个函数只做"延迟初始化"的工作，不做 EKF 更新。EKF 更新在 update() 里做。
+ * @param state The current state of the filter
+ * @param feature_vec The vector of features to be initialized
+ */
 void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec) {
 
   // Return if no features
@@ -78,10 +98,10 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
   auto it0 = feature_vec.begin();
   while (it0 != feature_vec.end()) {
 
-    // Clean the feature
+    // Clean the feature 清理掉不在克隆时刻上的观测
     (*it0)->clean_old_measurements(clonetimes);
 
-    // Count how many measurements
+    // Count how many measurements 统计该特征的总测量数
     int ct_meas = 0;
     for (const auto &pair : (*it0)->timestamps) {
       ct_meas += (*it0)->timestamps[pair.first].size();
@@ -98,6 +118,7 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
   rT1 = boost::posix_time::microsec_clock::local_time();
 
   // 2. Create vector of cloned *CAMERA* poses at each of our clone timesteps
+  // 创建相机位姿克隆图：遍历每个相机 × 每个克隆时刻，计算相机在世界系下的位姿
   std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> clones_cam;
   for (const auto &clone_calib : state->_calib_IMUtoCAM) {
 
@@ -118,6 +139,7 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
   }
 
   // 3. Try to triangulate all MSCKF or new SLAM features that have measurements
+  // 三角化+高斯牛顿精化：遍历每个特征，尝试三角化出 3D 位置，再用高斯牛顿精化。失败（退化、射线平行）→ 剔除，避免带病特征进更新。
   auto it1 = feature_vec.begin();
   while (it1 != feature_vec.end()) {
 
@@ -157,9 +179,11 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     feat.timestamps = (*it2)->timestamps;
 
     // If we are using single inverse depth, then it is equivalent to using the msckf inverse depth
+    // 利用ID大小区分 ArUco 特征和 SLAM 特征，分别使用不同的表示方式
     auto feat_rep =
         ((int)feat.featid < state->_options.max_aruco_features) ? state->_options.feat_rep_aruco : state->_options.feat_rep_slam;
     feat.feat_representation = feat_rep;
+    // 单深度表示（SINGLE）在构造雅可比时被临时当成 MSCKF 逆深度——因为 SINGLE 只差"把 bearing 边缘化掉"这一步，后面单独处理。
     if (feat_rep == LandmarkRepresentation::Representation::ANCHORED_INVERSE_DEPTH_SINGLE) {
       feat.feat_representation = LandmarkRepresentation::Representation::ANCHORED_MSCKF_INVERSE_DEPTH;
     }
@@ -176,20 +200,27 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     }
 
     // Our return values (feature jacobian, state jacobian, residual, and order of state jacobian)
-    Eigen::MatrixXd H_f;
-    Eigen::MatrixXd H_x;
-    Eigen::VectorXd res;
+    Eigen::MatrixXd H_f;  // 观测对特征的雅可比矩阵（残差对特征的偏导数） 2m x 3 或 2m x 1
+    Eigen::MatrixXd H_x;  // 观测对状态的雅可比矩阵（残差对状态的偏导数） 2m x 已有状态维数
+    Eigen::VectorXd res;  // 观测残差向量（实际观测 - 预测观测）
     std::vector<std::shared_ptr<Type>> Hx_order;
 
-    // Get the Jacobian for this feature
+    // Get the Jacobian for this feature 构造雅可比矩阵和残差向量
     UpdaterHelper::get_feature_jacobian_full(state, feat, H_f, H_x, res, Hx_order);
 
     // If we are doing the single feature representation, then we need to remove the bearing portion
     // To do so, we project the bearing portion onto the state and depth Jacobians and the residual.
     // This allows us to directly initialize the feature as a depth-old feature
+    // 为什么要这样做？
+    // 单深度表示的路标在状态里只有 1 个自由度（深度ρ），bearing（2 维）在初始化时就被边缘化固定了（不再估计）。所以
+    // 1. 把深度的雅可比抽出来，和状态雅可比拼在一起（H_xf）；
+    // 2. 剩下的 bearing 雅可比（H_f）用零空间投影消掉——这一步至关重要，它承认"bearing 不是精确已知的，
+    // 我们也一并把它边缘化掉了"，保证估计器一致性（否则会过于乐观）
+    // 3. 投影完再拆开：H_x = 对已有状态，H_f = 对新路标的 1 维深度
     if (feat_rep == LandmarkRepresentation::Representation::ANCHORED_INVERSE_DEPTH_SINGLE) {
 
       // Append the Jacobian in respect to the depth of the feature
+      // 把深度(1维)的雅可比并到 H_xf 末尾，H_f 只留 bearing(2维)
       Eigen::MatrixXd H_xf = H_x;
       H_xf.conservativeResize(H_x.rows(), H_x.cols() + 1);
       H_xf.block(0, H_x.cols(), H_x.rows(), 1) = H_f.block(0, H_f.cols() - 1, H_f.rows(), 1);
@@ -198,15 +229,19 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
       // Nullspace project the bearing portion
       // This takes into account that we have marginalized the bearing already
       // Thus this is crucial to ensuring estimator consistency as we are not taking the bearing to be true
+      // 把 bearing 部分零空间投影掉
       UpdaterHelper::nullspace_project_inplace(H_f, H_xf, res);
 
       // Split out the state portion and feature portion
+      // 再拆回: H_x = 状态部分, H_f = 深度部分
       H_x = H_xf.block(0, 0, H_xf.rows(), H_xf.cols() - 1);
       H_f = H_xf.block(0, H_xf.cols() - 1, H_xf.rows(), 1);
     }
 
     // Create feature pointer (we will always create it of size three since we initialize the single invese depth as a msckf anchored
     // representation)
+    // 创建路标对象：如果是单深度表示，路标在状态里只有 1 个自由度（深度ρ），否则是 3 个自由度（xyz）。
+    // 注意这里的路标对象只是一个临时对象，后续要把它加入滤波器状态。
     int landmark_size = (feat_rep == LandmarkRepresentation::Representation::ANCHORED_INVERSE_DEPTH_SINGLE) ? 1 : 3;
     auto landmark = std::make_shared<Landmark>(landmark_size);
     landmark->_featid = feat.featid;
@@ -221,6 +256,7 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
       landmark->set_from_xyz(feat.p_FinG, false);
       landmark->set_from_xyz(feat.p_FinG_fej, true);
     }
+    // 路标的初值来自三角化结果（p_FinA/p_FinG），当前值和 FEJ 值都存好。之后 initialize 会用观测把它精化
 
     // Measurement noise matrix
     double sigma_pix_sq =
@@ -230,6 +266,7 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     // Try to initialize, delete new pointer if we failed
     double chi2_multipler =
         ((int)feat.featid < state->_options.max_aruco_features) ? _options_aruco.chi2_multipler : _options_slam.chi2_multipler;
+    // MSCKF后面会消掉H_f，而SLAM不会，而且会把H_f用来初始化路标的协方差和交叉项
     if (StateHelper::initialize(state, landmark, Hx_order, H_x, H_f, R, res, chi2_multipler)) {
       state->_features_SLAM.insert({(*it2)->featid, landmark});
       (*it2)->to_delete = true;
