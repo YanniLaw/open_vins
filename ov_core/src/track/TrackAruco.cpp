@@ -171,6 +171,18 @@ void TrackAruco::perform_tracking(double timestamp, const cv::Mat &imgin, size_t
   PRINT_ALL("[TIME-ARUCO]: %.4f seconds for total\n", (rT3 - rT1).total_microseconds() * 1e-6);
 }
 
+/**
+ * @brief Display the active ArUco tracks on the given image
+ * 
+ * @param img_out The output image on which to draw the active tracks
+ * @param r1 Red component of the first color
+ * @param g1 Green component of the first color
+ * @param b1 Blue component of the first color
+ * @param r2 Red component of the second color
+ * @param g2 Green component of the second color
+ * @param b2 Blue component of the second color
+ * @param overlay Text overlay to display on the image
+ */
 void TrackAruco::display_active(cv::Mat &img_out, int r1, int g1, int b1, int r2, int g2, int b2, std::string overlay) {
 
   // Cache the images to prevent other threads from editing while we viz (which can be slow)

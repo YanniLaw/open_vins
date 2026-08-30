@@ -287,6 +287,12 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
   }
 }
 
+/**
+ * @brief Update the SLAM state with the given feature measurements.
+ * 用已经在状态向量里的 SLAM 特征（landmark）的最新观测，对滤波器状态做 EKF 更新
+ * @param state The current SLAM state.
+ * @param feature_vec The vector of feature measurements to update the state with.
+ */
 void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec) {
 
   // Return if no features
@@ -319,15 +325,19 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     // Get the landmark and its representation
     // For single depth representation we need at least two measurement
     // This is because we do nullspace projection
+    // 按照特征表示区分最小观测数:
+    // 1. 单深度表示的路标在状态里只有 1 个自由度（深度ρ），bearing（2 维）在初始化时就被边缘化了。
+    //    更新时需要对观测做零空间投影消掉 bearing 自由度，至少要有 2 个观测才够
+    // 2. 其他表示的路标在状态里有 3 个自由度（xyz），只要有 1 个观测就能约束它。
     std::shared_ptr<Landmark> landmark = state->_features_SLAM.at((*it0)->featid);
     int required_meas = (landmark->_feat_representation == LandmarkRepresentation::Representation::ANCHORED_INVERSE_DEPTH_SINGLE) ? 2 : 1;
 
     // Remove if we don't have enough
     if (ct_meas < 1) {
       (*it0)->to_delete = true;
-      it0 = feature_vec.erase(it0);
+      it0 = feature_vec.erase(it0); // 该特征彻底没用了，这一轮也不用
     } else if (ct_meas < required_meas) {
-      it0 = feature_vec.erase(it0);
+      it0 = feature_vec.erase(it0); // 仅从本轮移除（不标删除），等下次观测凑够了再更新
     } else {
       it0++;
     }
@@ -338,27 +348,34 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
   size_t max_meas_size = 0;
   for (size_t i = 0; i < feature_vec.size(); i++) {
     for (const auto &pair : feature_vec.at(i)->timestamps) {
+      // 每个观测提供 2 个残差（像素坐标 u,v），所以总残差维数 = 2 * 所有特征的观测数
       max_meas_size += 2 * feature_vec.at(i)->timestamps[pair.first].size();
     }
   }
 
   // Calculate max possible state size (i.e. the size of our covariance)
-  size_t max_hx_size = state->max_covariance_size();
+  size_t max_hx_size = state->max_covariance_size(); // 当前完整协方差的维数
 
   // Large Jacobian, residual, and measurement noise of *all* features for this update
-  Eigen::VectorXd res_big = Eigen::VectorXd::Zero(max_meas_size);
-  Eigen::MatrixXd Hx_big = Eigen::MatrixXd::Zero(max_meas_size, max_hx_size);
-  Eigen::MatrixXd R_big = Eigen::MatrixXd::Identity(max_meas_size, max_meas_size);
-  std::unordered_map<std::shared_ptr<Type>, size_t> Hx_mapping;
-  std::vector<std::shared_ptr<Type>> Hx_order_big;
+  // 预分配大矩阵（批量更新的核心）
+  // 为什么一次性分配满？ 
+  // 因为 EKF 更新要把所有通过检验的特征拼接成一个大的线性系统，一次性 EKFUpdate，比逐特征更新快很多，
+  // 且保证一致性（同一批观测共享同一个线性化点）
+  Eigen::VectorXd res_big = Eigen::VectorXd::Zero(max_meas_size); // 所有特征的总残差
+  Eigen::MatrixXd Hx_big = Eigen::MatrixXd::Zero(max_meas_size, max_hx_size); // 对状态的总雅可比
+  Eigen::MatrixXd R_big = Eigen::MatrixXd::Identity(max_meas_size, max_meas_size); // 总测量噪声
+  std::unordered_map<std::shared_ptr<Type>, size_t> Hx_mapping; // 是"状态对象 → 在大 Hx_big 中的列偏移"的记账表
+  std::vector<std::shared_ptr<Type>> Hx_order_big; // 记录变量出现的顺序。同一个变量（比如某个克隆位姿 PoseJPL）被多个特征观测到，只登记一次列区间，后续追加到对应的列块。
   size_t ct_jacob = 0;
   size_t ct_meas = 0;
 
   // 4. Compute linear system for each feature, nullspace project, and reject
+  // 逐特征构造雅可比 → 卡方检验 → 拼接
   auto it2 = feature_vec.begin();
   while (it2 != feature_vec.end()) {
 
     // Ensure we have the landmark and it is the same
+    // 检查是否在状态向量里有这个路标，且 featid 一致
     assert(state->_features_SLAM.find((*it2)->featid) != state->_features_SLAM.end());
     assert(state->_features_SLAM.at((*it2)->featid)->_featid == (*it2)->featid);
 
@@ -396,21 +413,25 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     std::vector<std::shared_ptr<Type>> Hx_order;
 
     // Get the Jacobian for this feature
+    // 1. 统计涉及的状态变量（克隆位姿、路标）
+    // 2. 将特征位置统一到全局系
+    // 3. 计算残差向量以及对状态的雅可比矩阵
     UpdaterHelper::get_feature_jacobian_full(state, feat, H_f, H_x, res, Hx_order);
 
     // Place Jacobians in one big Jacobian, since the landmark is already in our state vector
+    // 拼接成 H_xf（路标已在状态里，直接并入状态雅可比）
     Eigen::MatrixXd H_xf = H_x;
     if (landmark->_feat_representation == LandmarkRepresentation::Representation::ANCHORED_INVERSE_DEPTH_SINGLE) {
 
       // Append the Jacobian in respect to the depth of the feature
       H_xf.conservativeResize(H_x.rows(), H_x.cols() + 1);
-      H_xf.block(0, H_x.cols(), H_x.rows(), 1) = H_f.block(0, H_f.cols() - 1, H_f.rows(), 1);
-      H_f.conservativeResize(H_f.rows(), H_f.cols() - 1);
+      H_xf.block(0, H_x.cols(), H_x.rows(), 1) = H_f.block(0, H_f.cols() - 1, H_f.rows(), 1); // 抽深度列
+      H_f.conservativeResize(H_f.rows(), H_f.cols() - 1); // 剩 bearing 列
 
       // Nullspace project the bearing portion
       // This takes into account that we have marginalized the bearing already
       // Thus this is crucial to ensuring estimator consistency as we are not taking the bearing to be true
-      UpdaterHelper::nullspace_project_inplace(H_f, H_xf, res);
+      UpdaterHelper::nullspace_project_inplace(H_f, H_xf, res); // 消 bearing
 
     } else {
 
@@ -419,7 +440,7 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
       H_xf.block(0, H_x.cols(), H_x.rows(), H_f.cols()) = H_f;
     }
 
-    // Append to our Jacobian order vector
+    // Append to our Jacobian order vector  // 把该特征对应的路标也加进状态列表
     std::vector<std::shared_ptr<Type>> Hxf_order = Hx_order;
     Hxf_order.push_back(landmark);
 
@@ -428,7 +449,7 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     Eigen::MatrixXd S = H_xf * P_marg * H_xf.transpose();
     double sigma_pix_sq =
         ((int)feat.featid < state->_options.max_aruco_features) ? _options_aruco.sigma_pix_sq : _options_slam.sigma_pix_sq;
-    S.diagonal() += sigma_pix_sq * Eigen::VectorXd::Ones(S.rows());
+    S.diagonal() += sigma_pix_sq * Eigen::VectorXd::Ones(S.rows()); // 新息协方差
     double chi2 = res.dot(S.llt().solve(res));
 
     // Get our threshold (we precompute up to 500 but handle the case that it is more)
@@ -442,6 +463,8 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     }
 
     // Check if we should delete or not
+    // ArUco 特征: 打印警告剔除本次观测，不算失败计数
+    // 普通 SLAM 特征: 累计失败次数，后续可能用于淘汰该路标，同样从本轮剔除
     double chi2_multipler =
         ((int)feat.featid < state->_options.max_aruco_features) ? _options_aruco.chi2_multipler : _options_slam.chi2_multipler;
     if (chi2 > chi2_multipler * chi2_check) {
@@ -462,12 +485,13 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     }
 
     // We are good!!! Append to our large H vector
+    // 通过检验的特征，拼入大矩阵
     size_t ct_hx = 0;
     for (const auto &var : Hxf_order) {
 
       // Ensure that this variable is in our Jacobian
       if (Hx_mapping.find(var) == Hx_mapping.end()) {
-        Hx_mapping.insert({var, ct_jacob});
+        Hx_mapping.insert({var, ct_jacob});  // 新变量登记列偏移
         Hx_order_big.push_back(var);
         ct_jacob += var->size();
       }
@@ -515,9 +539,27 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
   PRINT_ALL("[SLAM-UP]: %.4f seconds total\n", (rT3 - rT1).total_microseconds() * 1e-6);
 }
 
+/**
+ * @brief 
+ * 背景：什么是"锚点"，为什么需要换锚点？
+  在 OpenVINS 里，锚点式表示（如 ANCHORED_INVERSE_DEPTH、ANCHORED_INVERSE_DEPTH_SINGLE、
+  ANCHORED_MSCKF_INVERSE_DEPTH）的路标不直接存全局坐标，而是存相对于某个"锚点相机位姿"
+  （_anchor_clone_timestamp + _anchor_cam_id）的坐标（如逆深度 ρ 或归一化坐标）。
+ * 问题：状态里维持一个滑窗克隆。最老的克隆会被边缘化（marginalize）掉。
+  如果某个路标的锚点正好在那只要被边缘化的老克隆上，锚点坐标系就要消失了—— 
+  必须在边缘化之前把锚点"搬到"一个还活着的克隆（默认是最新的 IMU 克隆）上，
+  否则该路标就无法再被观测方程使用（update() 里取锚点位姿会访问一个已被移除的克隆）。
+
+  这正是 change_anchors 存在的意义：在边缘化发生前，把锚点落在"将死"克隆上的路标，重新锚定到新克隆。
+  不是重新估计 landmark，而是在旧 anchor clone 被滑窗删除前，对 anchored SLAM landmark 
+  做一次“带协方差和 FEJ 的严格状态重参数化”，从而让这个 landmark 能继续留在 EKF 里长期使用
+  调用时机：VioManager::do_feature_propagate_update() 在 StateHelper::marginalize_old_clone() 之前调用。
+ * @param state 
+ */
 void UpdaterSLAM::change_anchors(std::shared_ptr<State> state) {
 
   // Return if we do not have enough clones
+  // 1. 克隆数量没超过上限，说明还不会边缘化，直接返回
   if ((int)state->_clones_IMU.size() <= state->_options.max_clone_size) {
     return;
   }
@@ -525,20 +567,40 @@ void UpdaterSLAM::change_anchors(std::shared_ptr<State> state) {
   // Get the marginalization timestep, and change the anchor for any feature seen from it
   // NOTE: for now we have anchor the feature in the same camera as it is before
   // NOTE: this also does not change the representation of the feature at all right now
+  // 2. 拿到即将被边缘化的时间戳
   double marg_timestep = state->margtimestep();
+  // 3. 遍历所有 SLAM 路标
   for (auto &f : state->_features_SLAM) {
     // Skip any features that are in the global frame
+    // 跳过全局系表示（GLOBAL_3D / GLOBAL_FULL_INVERSE_DEPTH）
+    // 它们不依赖任何锚点，不需要换
     if (f.second->_feat_representation == LandmarkRepresentation::Representation::GLOBAL_3D ||
         f.second->_feat_representation == LandmarkRepresentation::Representation::GLOBAL_FULL_INVERSE_DEPTH)
       continue;
     // Else lets see if it is anchored in the clone that will be marginalized
+    // 若该路标的锚点正好在被边缘化的克隆时刻上
     assert(marg_timestep <= f.second->_anchor_clone_timestamp);
     if (f.second->_anchor_clone_timestamp == marg_timestep) {
+      // 搬到最新时刻的克隆，保持相机 id 不变
       perform_anchor_change(state, f.second, state->_timestamp, f.second->_anchor_cam_id);
     }
   }
 }
 
+/**
+ * @brief Change the anchor of a given SLAM landmark to a new clone and camera.
+ * 它的任务：把路标的位置值（含 FEJ 值）和协方差从"旧锚点表示"变换到"新锚点表示"。
+ * 核心思想是：同一个物理点新旧表示下是同一个量，只是参数化不同，所以可以先求新旧表示之间的误差传播雅可比Φ，
+ * 再用 Φ 做一次"协方差传播"
+  1. 计算旧锚点相机位姿（R_GtoOLD, p_OLDinG）和新锚点相机位姿（R_GtoNEW, p_NEWinG）
+  2. 计算旧锚点到新锚点的变换（R_OLDtoNEW, p_OLDinNEW）
+  3. 用变换把路标从旧锚点坐标系变换到新锚点坐标系，更新路标的 _anchor_clone_timestamp、_anchor_cam_id、p_FinA
+ * 
+ * @param state 主滤波器
+ * @param landmark 待换锚点的路标
+ * @param new_anchor_timestamp 新锚点的时间戳(状态最新的时间戳)
+ * @param new_cam_id 新锚点的相机 id
+ */
 void UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::shared_ptr<Landmark> landmark, double new_anchor_timestamp,
                                         size_t new_cam_id) {
 
@@ -556,8 +618,8 @@ void UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::share
   old_feat.p_FinA_fej = landmark->get_xyz(true);
 
   // Get Jacobians of p_FinG wrt old representation
-  Eigen::MatrixXd H_f_old;
-  std::vector<Eigen::MatrixXd> H_x_old;
+  Eigen::MatrixXd H_f_old; // 全局特征点对旧特征参数的雅可比矩阵（残差对旧特征参数的偏导数） 3 x 3 或 3 x 1
+  std::vector<Eigen::MatrixXd> H_x_old; // 全局特征点对旧锚点相关状态的雅可比矩阵（残差对状态的偏导数） 3 x 已有状态维数
   std::vector<std::shared_ptr<Type>> x_order_old;
   UpdaterHelper::get_feature_jacobian_representation(state, old_feat, H_f_old, H_x_old, x_order_old);
 
@@ -570,6 +632,7 @@ void UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::share
 
   //==========================================================================
   //==========================================================================
+  // 把位置值从旧锚点变换到新锚点（均值 + FEJ）
 
   // OLD: anchor camera position and orientation
   Eigen::Matrix<double, 3, 3> R_GtoIOLD = state->_clones_IMU.at(old_feat.anchor_clone_timestamp)->Rot();
@@ -609,6 +672,7 @@ void UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::share
   new_feat.p_FinA_fej = R_OLDtoNEW_fej * landmark->get_xyz(true) + p_OLDinNEW_fej;
 
   // Get Jacobians of p_FinG wrt new representation
+  // 计算在新锚点表示下的雅可比矩阵等
   Eigen::MatrixXd H_f_new;
   std::vector<Eigen::MatrixXd> H_x_new;
   std::vector<std::shared_ptr<Type>> x_order_new;
@@ -617,6 +681,18 @@ void UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::share
   //==========================================================================
   //==========================================================================
 
+  // anchor change 本质上是一个 state reparameterization
+  /* 因为新旧锚点表示下的路标是同一个物理点，只是参数化不同
+  所以有 G_Pf_old = h_old(λ_old,x_old) = G_Pf_new = h_new(λ_new,x_new)
+  对误差线性化
+  δG_Pf_old ≈ H_f_old * δλ_old + H_x_old * δx_old
+  δG_Pf_new ≈ H_f_new * δλ_new + H_x_new * δx_new
+  两者相等，所以有 
+  H_f_new * δλ_new + H_x_new * δx_new = H_f_old * δλ_old + H_x_old * δx_old
+  于是 δλ_new = H_f_new^{-1} * (H_f_old * δλ_old + H_x_old * δx_old - H_x_new * δx_new)
+  这就是 anchor change 的误差传播公式，H_f_new^{-1} 是新锚点表示下的路标误差对全局坐标误差的雅可比矩阵。
+  然后用 δλ_new 做一次协方差传播，得到新的协方差矩阵。
+  */
   // New phi order is just the landmark
   std::vector<std::shared_ptr<Type>> phi_order_NEW;
   phi_order_NEW.push_back(landmark);
@@ -658,6 +734,8 @@ void UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::share
   }
 
   // Place Jacobians for old anchor
+  //  δf_new = Phi * [δx_old; δx_new; δf_old]
+  // Phi = H_f_new^{-1} * [H_f_old, H_x_old, -H_x_new]
   for (size_t i = 0; i < H_x_old.size(); i++) {
     Phi.block(0, Phi_id_map.at(x_order_old[i]), phisize, x_order_old[i]->size()).noalias() += H_f_new_inv * H_x_old[i];
   }
@@ -671,7 +749,9 @@ void UpdaterSLAM::perform_anchor_change(std::shared_ptr<State> state, std::share
   }
 
   // Perform covariance propagation
-  StateHelper::EKFPropagation(state, phi_order_NEW, phi_order_OLD, Phi, Q);
+  // 因为这里anchor change 不是一个随机动态过程，它只是deterministic coordinate reparameterization
+  // 没有新增process noise，所以 Q = 0
+  StateHelper::EKFPropagation(state, phi_order_NEW, phi_order_OLD, Phi, Q); // Q = 0
 
   // Set state from new feature
   landmark->_featid = new_feat.featid;

@@ -230,6 +230,13 @@ bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
   return false;
 }
 
+/**
+ * @brief Retrangulate active tracks based on the latest camera message
+ * 它做两件事:
+ * 1. 对前端当前正在跟踪的所有特征（不只限更新用到的那些）重新做三角化，得到它们在当前帧时刻的 3D 位置（世界系 p_FinG）；
+ * 2. 把这些 3D 点投影到 cam0 当前帧，输出带深度信息的 uvd（u, v, depth），供下游直接消费。
+ * @param message The latest camera data message containing images and feature observations
+ */
 void VioManager::retriangulate_active_tracks(const ov_core::CameraData &message) {
 
   // Start timing
