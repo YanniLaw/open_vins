@@ -41,11 +41,29 @@ using namespace ov_core;
 using namespace ov_type;
 using namespace ov_init;
 
+/**
+ * @brief Initialize the dynamic state of the system using visual-inertial measurements within a specified time window.
+ * 动态 VIO 初始化器：在系统已经有任意运动（非静止）的前提下，仅凭一段时间窗口内的相机特征 + IMU 数据，
+ * 恢复初始 IMU 状态（姿态、位置、速度、零偏）、克隆位姿和 SLAM 路标，以及它们的协方差.
+ * 它的设计哲学:
+ * 1. 预积分相对旋转（假设零偏已知）
+ * 2. 构造线性系统求解速度（带 ∣g∣ 重力模长约束）
+ * 3. 做一次带标定的大 MLE（Ceres 图优化）并恢复协方差
+ * @param timestamp   输出: 初始化时刻（=最新相机时刻）
+ * @param covariance  输出: IMU 状态 15×15 协方差
+ * @param order       输出: 状态向量的顺序(只有IMU)
+ * @param _imu        输出: IMU 状态
+ * @param _clones_IMU 输出: 各个相机时刻的IMU 克隆状态
+ * @param _features_SLAM 输出: SLAM 特征点
+ * @return true  如果初始化成功
+ * @return false 如果初始化失败
+ */
 bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
                                     std::shared_ptr<ov_type::IMU> &_imu, std::map<double, std::shared_ptr<ov_type::PoseJPL>> &_clones_IMU,
                                     std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> &_features_SLAM) {
 
   // Get the newest and oldest timestamps we will try to initialize between!
+  // 取特征库里最新的相机时刻，初始化窗口 = [newest - init_window_time, newest]
   auto rT1 = boost::posix_time::microsec_clock::local_time();
   double newest_cam_time = -1;
   for (auto const &feat : _db->get_internal_data()) {
@@ -55,6 +73,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
       }
     }
   }
+  // init_window_time 定义"要积累多长时间的观测才够初始化"
   double oldest_time = newest_cam_time - params.init_window_time;
   if (newest_cam_time < 0 || oldest_time < 0) {
     return false;
@@ -62,13 +81,15 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
   // Remove all measurements that are older than our initialization window
   // Then we will try to use all features that are in the feature database!
-  _db->cleanup_measurements(oldest_time);
+  _db->cleanup_measurements(oldest_time); // 清掉窗口之前的旧测量
+  // 清掉窗口之前太老的 IMU，但要求窗口前"至少有一条旧 IMU"（用于边界插值）
   bool have_old_imu_readings = false;
   auto it_imu = imu_data->begin();
   while (it_imu != imu_data->end() && it_imu->timestamp < oldest_time + params.calib_camimu_dt) {
     have_old_imu_readings = true;
     it_imu = imu_data->erase(it_imu);
   }
+  // 特征/IMU 数量门槛
   if (_db->get_internal_data().size() < 0.75 * params.init_max_features) {
     PRINT_WARNING(RED "[init-d]: only %zu valid features of required (%.0f thresh)!!\n" RESET, _db->get_internal_data().size(),
                   0.95 * params.init_max_features);
@@ -83,7 +104,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // We do this to ensure that the feature database can continue to have new
   // measurements appended to it in an async-manor so this initialization
   // can be performed in a secondary thread while feature tracking is still performed.
-  std::unordered_map<size_t, std::shared_ptr<Feature>> features;
+  // 将特征数据库中的特征拷贝一份，以便在异步线程中进行初始化，而不影响特征跟踪的继续进行
+  std::unordered_map<size_t, std::shared_ptr<Feature>> features; // <特征ID, 特征对象>
   for (const auto &feat : _db->get_internal_data()) {
     auto feat_new = std::make_shared<Feature>();
     feat_new->featid = feat.second->featid;
@@ -97,38 +119,40 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // ======================================================
 
   // Settings
-  const int min_num_meas_to_optimize = (int)params.init_window_time;
+  const int min_num_meas_to_optimize = (int)params.init_window_time; // 每个特征最少观测数
   const int min_valid_features = 8;
 
   // Validation information for features we can use
-  bool have_stereo = false;
-  int count_valid_features = 0;
-  std::map<size_t, int> map_features_num_meas;
-  int num_measurements = 0;
+  // 特征筛选与相机位姿时刻选择
+  bool have_stereo = false;     // 是否有多相机观测同一特征
+  int count_valid_features = 0; // 观测数量达标的特征数
+  std::map<size_t, int> map_features_num_meas; // <特征ID, 该特征在初始化窗口内的有效观测数>
+  int num_measurements = 0; // 每个观测贡献两行，累加
   double oldest_camera_time = INFINITY;
-  std::map<double, bool> map_camera_times;
+  std::map<double, bool> map_camera_times; // 涉及的相机时刻集合（用于构建克隆位姿）
   map_camera_times[newest_cam_time] = true; // always insert final pose
-  std::map<size_t, bool> map_camera_ids;
+  std::map<size_t, bool> map_camera_ids; // 涉及的相机ID集合（用于构建克隆位姿）
+  // 按近似均匀的位姿频率挑选相机时刻：对每个特征，选那些"离已有位姿足够远（≥ pose_dt_avg）"或"恰好已有（免费复用）"的观测时刻，收集到 map_camera_times
   double pose_dt_avg = params.init_window_time / (double)(params.init_dyn_num_pose + 1);
   for (auto const &feat : features) {
 
     // Loop through each timestamp and make sure it is a valid pose
     std::vector<double> times;
     std::map<size_t, bool> camids;
-    for (auto const &camtime : feat.second->timestamps) {
-      for (double time : camtime.second) {
+    for (auto const &camtime : feat.second->timestamps) { // 遍历多个相机的时间观测
+      for (double time : camtime.second) { // 遍历该相机的每个观测时刻
         double time_dt = INFINITY;
         for (auto const &tmp : map_camera_times) {
-          time_dt = std::min(time_dt, std::abs(time - tmp.first));
+          time_dt = std::min(time_dt, std::abs(time - tmp.first)); // 与已有相机时刻的最小时间计算间隔
         }
         for (auto const &tmp : times) {
           time_dt = std::min(time_dt, std::abs(time - tmp));
         }
         // either this pose is a new one at the desired frequency
         // or it is a timestamp that we already have, thus can use for free
-        if (time_dt >= pose_dt_avg || time_dt == 0.0) {
+        if (time_dt >= pose_dt_avg || time_dt == 0.0) { // 满足时间间隔要求或已有观测时刻，加入有效观测列表
           times.push_back(time);
-          camids[camtime.first] = true;
+          camids[camtime.first] = true; // camtime.first 表示相机ID
         }
       }
     }
@@ -142,19 +166,20 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     for (auto const &tmp : times) {
       map_camera_times[tmp] = true;
       oldest_camera_time = std::min(oldest_camera_time, tmp);
-      num_measurements += 2;
+      num_measurements += 2; // 每个观测贡献两行残差（u、v）
     }
     for (auto const &tmp : camids) {
       map_camera_ids[tmp.first] = true;
     }
     if (camids.size() > 1) {
-      have_stereo = true;
+      have_stereo = true; // 至少有一个特征被多个相机观测到
     }
     count_valid_features++;
   }
 
   // Return if we do not have our full window or not enough measurements
   // Also check that we have enough features to initialize with
+  // 没有足够的位姿时刻或有效特征，直接放弃
   if ((int)map_camera_times.size() < params.init_dyn_num_pose) {
     return false;
   }
@@ -166,8 +191,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // Bias initial guesses specified by the launch file
   // We don't go through the effort to recover the biases right now since they should be
   // Semi-well known before launching or can be considered to be near zero...
-  Eigen::Vector3d gyroscope_bias = params.init_dyn_bias_g;
-  Eigen::Vector3d accelerometer_bias = params.init_dyn_bias_a;
+  Eigen::Vector3d gyroscope_bias = params.init_dyn_bias_g;      // 初始陀螺零偏猜测
+  Eigen::Vector3d accelerometer_bias = params.init_dyn_bias_a;  // 初始加速度计零偏猜测
 
   // Check that we have some angular velocity / orientation change
   double accel_inI_norm = 0.0;
@@ -186,6 +211,8 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     accel_inI_norm += am.norm();
   }
   accel_inI_norm /= (double)(readings.size() - 1);
+  // 为什么要这个检查？ 单目 VIO 初始化里，尺度/重力/速度只能从"运动产生的视差"中恢复。
+  // 如果设备几乎不动，观测退化，初始化无解或病态。所以要求窗口内有足够的角运动（默认如几度），否则拒绝。
   if (180.0 / M_PI * theta_inI_norm < params.init_dyn_min_deg) {
     PRINT_WARNING(YELLOW "[init-d]: gyroscope only %.2f degree change (%.2f thresh)\n" RESET, 180.0 / M_PI * theta_inI_norm,
                   params.init_dyn_min_deg);
@@ -226,12 +253,15 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // https://ieeexplore.ieee.org/abstract/document/6386235
   // State ordering is: [features, velocity, gravity]
   // Feature size of 1 will use the first ever bearing of the feature as true (depth only..)
+  // 构造线性系统求 [特征, 速度, 重力]
   const bool use_single_depth = false;
-  int size_feature = (use_single_depth) ? 1 : 3;
-  int num_features = count_valid_features;
+  int size_feature = (use_single_depth) ? 1 : 3; // 默认用 3D 特征位置
+  int num_features = count_valid_features; // 使用的特征数 = 观测数量达标的特征数
   int system_size = size_feature * num_features + 3 + 3;
 
   // Make sure we have enough measurements to fully constrain the system
+  // num_measurements 是所有有效特征在所有时间观测的总数（每个时间观测贡献两行残差）
+  // 一般来说，num_measurements 应该远远大于 system_size，否则系统欠定，无法求解。
   if (num_measurements < system_size) {
     PRINT_WARNING(YELLOW "[init-d]: not enough feature measurements (%d meas vs %d state size)!\n" RESET, num_measurements, system_size);
     return false;
@@ -241,11 +271,14 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   assert(oldest_camera_time < newest_cam_time);
   double last_camera_timestamp = 0.0;
   std::map<double, std::shared_ptr<ov_core::CpiV1>> map_camera_cpi_I0toIi, map_camera_cpi_IitoIi1;
+  // 遍历挑选出来的所有相机时间，进行预积分
+  // 这里用到了两个预积分器:
+  // I0toIi 用于线性系统求解，IitoIi1 用于 MLE 优化
   for (auto const &timepair : map_camera_times) {
 
     // No preintegration at the first timestamp
     double current_time = timepair.first;
-    if (current_time == oldest_camera_time) {
+    if (current_time == oldest_camera_time) { // 第一个相机时刻不做预积分，直接初始化为 nullptr
       map_camera_cpi_I0toIi.insert({current_time, nullptr});
       map_camera_cpi_IitoIi1.insert({current_time, nullptr});
       last_camera_timestamp = current_time;
@@ -253,6 +286,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     }
 
     // Perform our preintegration from I0 to Ii (used in the linear system)
+    // 从oldest_camera_time 到 current_time 做预积分，得到相对位姿约束（用于线性系统求解）
     double cpiI0toIi1_time0_in_imu = oldest_camera_time + params.calib_camimu_dt;
     double cpiI0toIi1_time1_in_imu = current_time + params.calib_camimu_dt;
     auto cpiI0toIi1 = std::make_shared<ov_core::CpiV1>(params.sigma_w, params.sigma_wb, params.sigma_a, params.sigma_ab, true);
@@ -264,12 +298,14 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
                   cpiI0toIi1_readings.size());
       return false;
     }
+    // 检查预积分覆盖的 IMU 时长与期望时长一致（>0.01 容差），否则放弃——保证没有漏掉 IMU 数据
     double cpiI0toIi1_dt_imu = cpiI0toIi1_readings.at(cpiI0toIi1_readings.size() - 1).timestamp - cpiI0toIi1_readings.at(0).timestamp;
     if (std::abs(cpiI0toIi1_dt_imu - (cpiI0toIi1_time1_in_imu - cpiI0toIi1_time0_in_imu)) > 0.01) {
       PRINT_DEBUG(YELLOW "[init-d]: camera IMU was only propagated %.3f of %.3f\n" RESET, cpiI0toIi1_dt_imu,
                   (cpiI0toIi1_time1_in_imu - cpiI0toIi1_time0_in_imu));
       return false;
     }
+    // 将选出来的IMU数据喂给预积分器
     for (size_t k = 0; k < cpiI0toIi1_readings.size() - 1; k++) {
       auto imu0 = cpiI0toIi1_readings.at(k);
       auto imu1 = cpiI0toIi1_readings.at(k + 1);
@@ -277,6 +313,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     }
 
     // Perform our preintegration from Ii to Ii1 (used in the mle optimization)
+    // 从 last_camera_timestamp 到 current_time 做预积分，得到相对位姿约束（用于MLE优化）
     double cpiIitoIi1_time0_in_imu = last_camera_timestamp + params.calib_camimu_dt;
     double cpiIitoIi1_time1_in_imu = current_time + params.calib_camimu_dt;
     auto cpiIitoIi1 = std::make_shared<ov_core::CpiV1>(params.sigma_w, params.sigma_wb, params.sigma_a, params.sigma_ab, true);
@@ -308,30 +345,34 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
   // Loop through each feature observation and append it!
   // State ordering is: [features, velocity, gravity]
+  // 先做线性初始化
+  // 如果直接把所有变量全部放到一个大优化里，容易陷入局部最优解，尤其是特征深度和重力方向。
+  // 所以先做线性系统求解，得到一个较好的初始值
   Eigen::MatrixXd A = Eigen::MatrixXd::Zero(num_measurements, system_size);
   Eigen::VectorXd b = Eigen::VectorXd::Zero(num_measurements);
   PRINT_DEBUG("[init-d]: system of %d measurement x %d states created (%d features, %s)\n", num_measurements, system_size, num_features,
               (have_stereo) ? "stereo" : "mono");
   int index_meas = 0;
   int idx_feat = 0;
-  std::map<size_t, int> A_index_features;
+  std::map<size_t, int> A_index_features; // <特征ID, 在A矩阵中对应的列索引>，用于定位每个特征在状态向量中的位置
   for (auto const &feat : features) {
+    // 跳过有效观测次数不足的特征，保证每个特征都有足够的观测用于优化
     if (map_features_num_meas[feat.first] < min_num_meas_to_optimize)
       continue;
     if (A_index_features.find(feat.first) == A_index_features.end()) {
       A_index_features.insert({feat.first, idx_feat});
       idx_feat += 1;
     }
-    for (auto const &camtime : feat.second->timestamps) {
+    for (auto const &camtime : feat.second->timestamps) { // 遍历每个相机的所有观测时间戳
 
       // This camera
-      size_t cam_id = camtime.first;
+      size_t cam_id = camtime.first; // cam_id 表示相机ID
       Eigen::Vector4d q_ItoC = params.camera_extrinsics.at(cam_id).block(0, 0, 4, 1);
       Eigen::Vector3d p_IinC = params.camera_extrinsics.at(cam_id).block(4, 0, 3, 1);
       Eigen::Matrix3d R_ItoC = quat_2_Rot(q_ItoC);
 
       // Loop through each observation
-      for (size_t i = 0; i < camtime.second.size(); i++) {
+      for (size_t i = 0; i < camtime.second.size(); i++) { // 遍历每个相机在该时间戳下的所有观测
 
         // Skip measurements we don't have poses for
         double time = feat.second->timestamps.at(cam_id).at(i);
@@ -353,11 +394,15 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
         }
 
         // Create the linear system based on the feature reprojection
+        // 对每个特征在时刻Ik的观测，先构造归一化坐标的投影零空间 H_proj
+        // H_proj * p_FinCi = 0 点p_FinCi投影到[u,v]后，叉乘约束
         // [ 1 0 -u ] p_FinCi = [ 0 ]
         // [ 0 1 -v ]           [ 0 ]
         // where
         // p_FinCi = R_C0toCi * R_ItoC * (p_FinI0 - p_IiinI0) + p_IinC
         //         = R_C0toCi * R_ItoC * (p_FinI0 - v_I0inI0 * dt - 0.5 * grav_inI0 * dt^2 - alpha) + p_IinC
+        // 线性系统通过消元和重排，可以写成 Ax = b 的形式，
+        // 其中 x = [p_FinI0,.....,p_FinI0_n, v_I0inI0, grav_inI0]，A是H_i，b是b_i
         Eigen::MatrixXd H_proj = Eigen::MatrixXd::Zero(2, 3);
         H_proj << 1, 0, -uv_norm(0), 0, 1, -uv_norm(1);
         Eigen::MatrixXd Y = H_proj * R_ItoC * R_I0toIk;
@@ -392,9 +437,12 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // Eigen::MatrixXd x_hat = AtA.colPivHouseholderQr().solve(Atb);
 
   // Constrained solving |g| = 9.81 constraint
+  //  带 ∣g∣ 约束求解（Dong-Si 多项式法）
+  // 从约束中消去其余变量，把问题归约为关于重力 g 的小系统： g = (D - λI)^(-1) * d
+  // 其中λ由Dong-Si 方法导出的多项式决定。代码用友矩阵（companion matrix）求特征值来找多项式根
   Eigen::MatrixXd A1 = A.block(0, 0, A.rows(), A.cols() - 3);
   // Eigen::MatrixXd A1A1_inv = (A1.transpose() * A1).inverse();
-  Eigen::MatrixXd A1A1_inv = (A1.transpose() * A1).llt().solve(Eigen::MatrixXd::Identity(A1.cols(), A1.cols()));
+  Eigen::MatrixXd A1A1_inv = (A1.transpose() * A1).llt().solve(Eigen::MatrixXd::Identity(A1.cols(), A1.cols())); // 伪逆用 LLT
   Eigen::MatrixXd A2 = A.block(0, A.cols() - 3, A.rows(), 3);
   Eigen::MatrixXd Temp = A2.transpose() * (Eigen::MatrixXd::Identity(A1.rows(), A1.rows()) - A1 * A1A1_inv * A1.transpose());
   Eigen::MatrixXd D = Temp * A2;
@@ -403,6 +451,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
   // Create companion matrix of our polynomial
   // https://en.wikipedia.org/wiki/Companion_matrix
+  // 构造友矩阵
   assert(coeff(0) == 1);
   Eigen::Matrix<double, 6, 6> companion_matrix = Eigen::Matrix<double, 6, 6>::Zero(coeff.rows() - 1, coeff.rows() - 1);
   companion_matrix.diagonal(-1).setOnes();
@@ -418,6 +467,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   }
 
   // Find its eigenvalues (can be complex)
+  // 特征值 = 多项式根
   Eigen::EigenSolver<Eigen::Matrix<double, 6, 6>> solver(companion_matrix, false);
   if (solver.info() != Eigen::Success) {
     PRINT_ERROR(RED "[init-d]: failed to compute the eigenvalue decomposition!!\n" RESET);
@@ -427,6 +477,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // Find the smallest real eigenvalue
   // NOTE: we find the one that gives us minimal constraint cost
   // NOTE: not sure if the best, but one that gives the correct mag should be good?
+  // 在所有实特征值里，选使∣g∣−g0代价最小的那个 λmin
   bool lambda_found = false;
   double lambda_min = -1;
   double cost_min = INFINITY;
@@ -462,6 +513,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   Eigen::VectorXd state_grav = D_lambdaI_inv * d;
 
   // Overwrite our state: [features, velocity, gravity]
+  // 回代恢复特征和速度
   Eigen::VectorXd state_feat_vel = -A1A1_inv * A1.transpose() * A2 * state_grav + A1A1_inv * A1.transpose() * b;
   Eigen::MatrixXd x_hat = Eigen::MatrixXd::Zero(system_size, 1);
   x_hat.block(0, 0, size_feature * num_features + 3, 1) = state_feat_vel;
@@ -470,6 +522,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   PRINT_INFO("[init-d]: velocity in I0 was %.3f,%.3f,%.3f and |v| = %.4f\n", v_I0inI0(0), v_I0inI0(1), v_I0inI0(2), v_I0inI0.norm());
 
   // Check gravity magnitude to see if converged
+  // 检查重力是否收敛
   Eigen::Vector3d gravity_inI0 = x_hat.block(size_feature * num_features + 3, 0, 3, 1);
   double init_max_grav_difference = 1e-3;
   if (std::abs(gravity_inI0.norm() - params.gravity_mag) > init_max_grav_difference) {
@@ -550,8 +603,10 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
   // Convert our states to be a gravity aligned global frame of reference
   // Here we say that the I0 frame is at 0,0,0 and shared the global origin
+  // 转换到重力对齐的全局系
+  // 线性系统解出的是在 I0系里的重力g_I0, 把它对齐到全局系的z轴上，得到旋转矩阵 R_GtoI0
   Eigen::Matrix3d R_GtoI0;
-  InitializerHelper::gram_schmidt(gravity_inI0, R_GtoI0);
+  InitializerHelper::gram_schmidt(gravity_inI0, R_GtoI0); // 施密特正交化
   Eigen::Vector4d q_GtoI0 = rot_2_quat(R_GtoI0);
   Eigen::Vector3d gravity;
   gravity << 0.0, 0.0, params.gravity_mag;
@@ -574,6 +629,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   ceres::Problem problem;
 
   // Our system states (map from time to index)
+  // 每个相机时刻一个 16 维 IMU 状态
   std::map<double, int> map_states;
   std::vector<double *> ceres_vars_ori;
   std::vector<double *> ceres_vars_pos;
@@ -582,15 +638,18 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   std::vector<double *> ceres_vars_bias_a;
 
   // Feature states (3dof p_FinG)
+  // 每个特征点在全局系下的三维位置
   std::map<size_t, int> map_features;
   std::vector<double *> ceres_vars_feat;
 
   // Setup extrinsic calibration q_ItoC, p_IinC (map from camera id to index)
+  // 相机外参
   std::map<size_t, int> map_calib_cam2imu;
   std::vector<double *> ceres_vars_calib_cam2imu_ori;
   std::vector<double *> ceres_vars_calib_cam2imu_pos;
 
   // Setup intrinsic calibration focal, center, distortion (map from camera id to index)
+  // 相机内参
   std::map<size_t, int> map_calib_cam;
   std::vector<double *> ceres_vars_calib_cam_intrinsics;
 
@@ -620,7 +679,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   // NOTE: We use dense schur since after eliminating features we have a dense problem
   // NOTE: http://ceres-solver.org/solving_faqs.html#solving
   ceres::Solver::Options options;
-  options.linear_solver_type = ceres::DENSE_SCHUR;
+  options.linear_solver_type = ceres::DENSE_SCHUR;  // 消去路标后是稠密问题
   options.trust_region_strategy_type = ceres::DOGLEG;
   // options.linear_solver_type = ceres::SPARSE_SCHUR;
   // options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
@@ -925,6 +984,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   };
 
   // Our most recent state is the IMU state!
+  // 提取结果
   assert(map_states.find(newest_cam_time) != map_states.end());
   if (_imu == nullptr) {
     _imu = std::make_shared<ov_type::IMU>();
@@ -1002,11 +1062,12 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   covariance_blocks.push_back(std::make_pair(ceres_vars_bias_g[state_index], ceres_vars_bias_a[state_index]));
 
   // Finally, compute the covariance
+  // 协方差恢复
   ceres::Covariance::Options options_cov;
   options_cov.null_space_rank = (!params.init_dyn_mle_opt_calib) * ((int)map_calib_cam2imu.size() * (6 + 8));
   options_cov.min_reciprocal_condition_number = params.init_dyn_min_rec_cond;
   // options_cov.algorithm_type = ceres::CovarianceAlgorithmType::DENSE_SVD;
-  options_cov.apply_loss_function = true; // Better consistency if we use this
+  options_cov.apply_loss_function = true; // Better consistency if we use this 一致性更好
   options_cov.num_threads = params.init_dyn_mle_max_threads;
   ceres::Covariance problem_cov(options_cov);
   bool success = problem_cov.Compute(covariance_blocks, &problem);
@@ -1073,6 +1134,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   covariance.block(12, 9, 3, 3) = covtmp.transpose().eval();
 
   // inflate as needed
+  // 协方差膨胀: 初始化受外点/退化影响，真实不确定性通常被低估，乘一个 >1 的系数避免"过于自信"，让后续滤波器慢慢收敛
   covariance.block(0, 0, 3, 3) *= params.init_dyn_inflation_orientation;
   covariance.block(6, 6, 3, 3) *= params.init_dyn_inflation_velocity;
   covariance.block(9, 9, 3, 3) *= params.init_dyn_inflation_bias_gyro;
@@ -1089,7 +1151,7 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
 
   // Set our position to be zero
   Eigen::MatrixXd x = _imu->value();
-  x.block(4, 0, 3, 1).setZero();
+  x.block(4, 0, 3, 1).setZero(); // [q, p, v, bg, ba] 设置位置为零
   _imu->set_value(x);
   _imu->set_fej(x);
 
@@ -1102,6 +1164,6 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   PRINT_DEBUG("[TIME]: %.4f sec for ceres opt\n", (rT6 - rT5).total_microseconds() * 1e-6);
   PRINT_DEBUG("[TIME]: %.4f sec for ceres covariance\n", (rT7 - rT6).total_microseconds() * 1e-6);
   PRINT_DEBUG("[TIME]: %.4f sec total for initialization\n", (rT7 - rT1).total_microseconds() * 1e-6);
-  free_state_memory();
+  free_state_memory(); // 释放初始化过程中分配的状态内存
   return true;
 }

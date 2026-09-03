@@ -79,11 +79,11 @@ void InertialInitializer::feed_imu(const ov_core::ImuData &message, double oldes
 /**
  * @brief Initialize the system using IMU and feature data within a specified time window
  * 
- * @param timestamp 初始化的时间戳
- * @param covariance 初始化的协方差矩阵
- * @param order 
- * @param t_imu IMU状态
- * @param wait_for_jerk 是否等待加加速度（Jerk）来初始化(也就是是否开启了零速度更新ZUPT)
+ * @param timestamp   输出: 初始化的时间戳
+ * @param covariance  输出: 初始化的协方差矩阵
+ * @param order       输出: 状态向量的顺序
+ * @param t_imu       原地修改IMU状态 state->_imu
+ * @param wait_for_jerk 输入: 是否等待加加速度（Jerk）来初始化(也就是是否开启了零速度更新ZUPT)
  * @return true 
  * @return false 
  */

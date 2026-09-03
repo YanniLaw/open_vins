@@ -320,7 +320,7 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   // If we do not have VIO initialization, then try to initialize
   // TODO: Or if we are trying to reset the system, then do that here!
   if (!is_initialized_vio) {
-    is_initialized_vio = try_to_initialize(message);
+    is_initialized_vio = try_to_initialize(message); // call initializer to initialize VIO
     if (!is_initialized_vio) {
       double time_track = (rT2 - rT1).total_microseconds() * 1e-6;
       PRINT_DEBUG(BLUE "[TIME]: %.4f seconds for tracking\n" RESET, time_track);
